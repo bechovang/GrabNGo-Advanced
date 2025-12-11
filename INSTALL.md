@@ -60,13 +60,18 @@ pip install torch torchvision torchaudio
 ### Bước 5: Cài đặt các package còn lại
 
 ```bash
-pip install ultralytics opencv-python numpy pillow
+pip install ultralytics opencv-python numpy pillow torchreid scikit-learn
 ```
 
-Hoặc nếu đã cài PyTorch, bạn có thể cài từ requirements.txt (bỏ qua torch):
+Hoặc cài từ requirements.txt:
 ```bash
-pip install ultralytics opencv-python numpy pillow
+pip install -r requirements.txt
 ```
+
+**Lưu ý về torchreid:**
+- torchreid sẽ tự động tải pretrained OSNet model khi chạy lần đầu
+- Model sẽ được cache trong `~/.torchreid/` hoặc `C:\Users\<username>\.torchreid\`
+- Kích thước model: ~50MB
 
 ### Bước 6: Kiểm tra cài đặt
 

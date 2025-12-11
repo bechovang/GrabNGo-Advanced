@@ -7,22 +7,250 @@ from collections import defaultdict, deque
 import json
 from datetime import datetime
 
-class CustomerTracker:
-    """Tracker nâng cao sử dụng BoT-SORT/ByteTrack có sẵn trong Ultralytics"""
+class LightweightReID:
+    """Lightweight ReID với features cải tiến: HOG + LAB Color + Spatial Pyramid"""
+    
     def __init__(self):
+        self.feature_dim = 512  # Tăng từ 256 lên 512 cho chính xác hơn
+        
+    def extract_features(self, frame, bbox):
+        """Extract appearance features từ bbox với nhiều loại features"""
+        try:
+            x1, y1, x2, y2 = map(int, bbox)
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(frame.shape[1], x2)
+            y2 = min(frame.shape[0], y2)
+            
+            if x2 <= x1 or y2 <= y1:
+                return None
+            
+            person_crop = frame[y1:y2, x1:x2]
+            if person_crop.size == 0:
+                return None
+            
+            # Resize to standard size (128x256)
+            person_crop = cv2.resize(person_crop, (128, 256))
+            
+            # Split into 3 regions: head, torso, legs (spatial pyramid)
+            h = person_crop.shape[0]
+            head = person_crop[:int(h*0.3), :]      # Upper 30%
+            torso = person_crop[int(h*0.3):int(h*0.7), :]  # Middle 40%
+            legs = person_crop[int(h*0.7):, :]      # Lower 30%
+            
+            # Extract features from each region
+            features_list = []
+            
+            # 1. LAB Color features (tốt hơn HSV cho ReID)
+            head_lab = self.extract_lab_color_features(head)
+            torso_lab = self.extract_lab_color_features(torso)
+            legs_lab = self.extract_lab_color_features(legs)
+            features_list.extend([head_lab, torso_lab, legs_lab])  # 3 * 64 = 192
+            
+            # 2. HOG features (Histogram of Oriented Gradients) - tốt hơn Sobel
+            head_hog = self.extract_hog_features(head)
+            torso_hog = self.extract_hog_features(torso)
+            legs_hog = self.extract_hog_features(legs)
+            features_list.extend([head_hog, torso_hog, legs_hog])  # 3 * 64 = 192
+            
+            # 3. Texture features (LBP-like)
+            head_texture = self.extract_texture_features(head)
+            torso_texture = self.extract_texture_features(torso)
+            legs_texture = self.extract_texture_features(legs)
+            features_list.extend([head_texture, torso_texture, legs_texture])  # 3 * 32 = 96
+            
+            # 4. Edge density features
+            head_edge = self.extract_edge_density(head)
+            torso_edge = self.extract_edge_density(torso)
+            legs_edge = self.extract_edge_density(legs)
+            features_list.extend([head_edge, torso_edge, legs_edge])  # 3 * 16 = 48
+            
+            # Concatenate all features
+            features = np.concatenate(features_list)  # Total: 528 dims
+            
+            # Trim or pad to exact dimension
+            if len(features) > self.feature_dim:
+                features = features[:self.feature_dim]
+            else:
+                features = np.pad(features, (0, self.feature_dim - len(features)), 'constant')
+            
+            # Normalize
+            features = features / (np.linalg.norm(features) + 1e-8)
+            
+            return features
+            
+        except Exception as e:
+            return None
+    
+    def extract_lab_color_features(self, img):
+        """Extract LAB color histogram (tốt hơn HSV cho ReID)"""
+        if img.size == 0:
+            return np.zeros(64)
+        
+        # Convert to LAB color space (perceptually uniform)
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        
+        # Calculate histograms for L, A, B channels
+        hist_l = cv2.calcHist([lab], [0], None, [32], [0, 100])  # L: 0-100
+        hist_a = cv2.calcHist([lab], [1], None, [16], [0, 255])  # A: 0-255
+        hist_b = cv2.calcHist([lab], [2], None, [16], [0, 255])  # B: 0-255
+        
+        # Normalize
+        hist_l = cv2.normalize(hist_l, hist_l).flatten()
+        hist_a = cv2.normalize(hist_a, hist_a).flatten()
+        hist_b = cv2.normalize(hist_b, hist_b).flatten()
+        
+        # Concatenate (32 + 16 + 16 = 64)
+        color_feat = np.concatenate([hist_l, hist_a, hist_b])
+        
+        return color_feat
+    
+    def extract_hog_features(self, img):
+        """Extract HOG (Histogram of Oriented Gradients) features"""
+        if img.size == 0:
+            return np.zeros(64)
+        
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Resize for consistent HOG computation
+        if gray.shape[0] < 8 or gray.shape[1] < 8:
+            gray = cv2.resize(gray, (16, 16))
+        
+        # Compute gradients
+        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        
+        # Magnitude and direction
+        magnitude = np.sqrt(gx**2 + gy**2)
+        direction = np.arctan2(gy, gx) * 180 / np.pi
+        direction = ((direction + 180) % 360).astype(np.uint8)
+        
+        # Create histogram of oriented gradients
+        # Divide into 8x8 cells, 9 orientation bins
+        h, w = magnitude.shape
+        cell_size = 8
+        n_cells_x = w // cell_size
+        n_cells_y = h // cell_size
+        
+        # Simplified HOG: histogram of gradient directions weighted by magnitude
+        hist = np.zeros(64)
+        for i in range(0, min(n_cells_y * cell_size, h), cell_size):
+            for j in range(0, min(n_cells_x * cell_size, w), cell_size):
+                cell_mag = magnitude[i:i+cell_size, j:j+cell_size]
+                cell_dir = direction[i:i+cell_size, j:j+cell_size]
+                
+                # Weighted histogram
+                for mag, dir_val in zip(cell_mag.flatten(), cell_dir.flatten()):
+                    bin_idx = int(dir_val / 360 * 64) % 64
+                    hist[bin_idx] += mag
+        
+        # Normalize
+        hist = hist / (np.linalg.norm(hist) + 1e-8)
+        
+        return hist
+    
+    def extract_texture_features(self, img):
+        """Extract texture features using local binary patterns (simplified)"""
+        if img.size == 0:
+            return np.zeros(32)
+        
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Resize for consistency
+        if gray.shape[0] < 8 or gray.shape[1] < 8:
+            gray = cv2.resize(gray, (16, 16))
+        
+        # Compute local variance (texture measure)
+        kernel = np.ones((3, 3), np.float32) / 9
+        local_mean = cv2.filter2D(gray.astype(np.float32), -1, kernel)
+        local_var = cv2.filter2D((gray.astype(np.float32) - local_mean)**2, -1, kernel)
+        
+        # Histogram of local variance
+        hist = cv2.calcHist([local_var.astype(np.uint8)], [0], None, [32], [0, 256])
+        hist = cv2.normalize(hist, hist).flatten()
+        
+        return hist
+    
+    def extract_edge_density(self, img):
+        """Extract edge density features"""
+        if img.size == 0:
+            return np.zeros(16)
+        
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Canny edges
+        edges = cv2.Canny(gray, 50, 150)
+        
+        # Divide into 4x4 grid and compute edge density per cell
+        h, w = edges.shape
+        grid_h, grid_w = 4, 4
+        cell_h, cell_w = h // grid_h, w // grid_w
+        
+        edge_density = []
+        for i in range(grid_h):
+            for j in range(grid_w):
+                cell = edges[i*cell_h:(i+1)*cell_h, j*cell_w:(j+1)*cell_w]
+                density = np.sum(cell > 0) / (cell_h * cell_w)
+                edge_density.append(density)
+        
+        # Pad to 16 if needed
+        edge_density = np.array(edge_density[:16])
+        if len(edge_density) < 16:
+            edge_density = np.pad(edge_density, (0, 16 - len(edge_density)), 'constant')
+        
+        return edge_density
+    
+    def compute_similarity(self, feat1, feat2):
+        """Compute cosine similarity between two feature vectors"""
+        if feat1 is None or feat2 is None:
+            return 0.0
+        
+        try:
+            dot_product = np.dot(feat1, feat2)
+            norm1 = np.linalg.norm(feat1)
+            norm2 = np.linalg.norm(feat2)
+            
+            similarity = dot_product / (norm1 * norm2 + 1e-8)
+            return float(np.clip(similarity, 0, 1))  # Clamp to [0, 1]
+        except:
+            return 0.0
+
+
+class CustomerTracker:
+    """Tracker nâng cao sử dụng BoT-SORT + Lightweight ReID"""
+    def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
         self.customers = {}  # {track_id: customer_data}
         self.next_customer_id = 1
         self.active_tracks = set()
         self.previous_tracks = set()
         self.logs = []
+        self.device = device
         
         # Track history để phát hiện người quay lại
         self.id_mapping = {}  # {old_track_id: customer_id}
         self.track_buffer = {}  # Buffer lưu tracks vừa mất
         self.max_buffer_time = 3.0  # 3 giây
         
-    def get_or_create_customer(self, track_id, bbox, frame_time):
-        """Lấy customer_id từ track_id, hoặc tạo mới nếu chưa có"""
+        # Lightweight ReID
+        print("🔄 Đang khởi tạo Lightweight ReID...")
+        self.reid_extractor = LightweightReID()
+        print(f"✅ Lightweight ReID đã sẵn sàng (Feature dim: {self.reid_extractor.feature_dim})")
+        
+        # ReID parameters
+        self.reid_threshold = 0.45  # Cosine similarity threshold (giảm xuống vì features tốt hơn)
+        self.reid_weight = 0.7  # Weight cho ReID score (tăng vì chính xác hơn)
+        self.iou_weight = 0.3  # Weight cho IoU score
+        
+    def get_or_create_customer(self, track_id, bbox, frame_time, frame=None, current_features=None):
+        """Lấy customer_id từ track_id, hoặc tạo mới nếu chưa có
+        
+        Args:
+            track_id: Track ID từ YOLO
+            bbox: Bounding box [x1, y1, x2, y2]
+            frame_time: Thời gian frame hiện tại
+            frame: Frame image để extract features (optional)
+            current_features: Pre-extracted features (optional)
+        """
         
         # Kiểm tra track_id đã có customer_id chưa
         if track_id in self.id_mapping:
@@ -30,41 +258,76 @@ class CustomerTracker:
             if customer_id in self.customers:
                 return customer_id, False  # Existing customer
         
+        # Extract features cho track mới nếu chưa có
+        if current_features is None and frame is not None:
+            current_features = self.reid_extractor.extract_features(frame, bbox)
+        
         # Kiểm tra có phải là người quay lại không (trong buffer)
+        best_match = None
+        best_score = 0.0
+        
         for old_track_id, buffer_data in list(self.track_buffer.items()):
             if frame_time - buffer_data['lost_time'] > self.max_buffer_time:
                 # Quá lâu, xóa khỏi buffer
                 del self.track_buffer[old_track_id]
                 continue
             
-            # Kiểm tra vị trí có gần không (người quay lại thường ở gần đó)
+            # Tính IoU score
             old_bbox = buffer_data['last_bbox']
-            iou = self.calculate_iou(bbox, old_bbox)
+            iou_score = self.calculate_iou(bbox, old_bbox)
             
-            # Nếu IoU > 0.3 trong vòng 3 giây → có thể là người quay lại
-            if iou > 0.3:
-                customer_id = buffer_data['customer_id']
-                self.id_mapping[track_id] = customer_id
-                
-                # Restore customer data
-                if customer_id not in self.customers:
-                    self.customers[customer_id] = buffer_data['customer_data']
-                
-                print(f"🔄 Nhận diện lại: {customer_id} (Track {old_track_id} → {track_id}) [IoU: {iou:.2f}]")
-                del self.track_buffer[old_track_id]
-                
-                # Log re-entry
-                log_entry = {
-                    'customer_id': customer_id,
+            # Tính ReID score nếu có features
+            reid_score = 0.0
+            if current_features is not None and 'features' in buffer_data:
+                old_features = buffer_data['features']
+                if old_features is not None:
+                    reid_score = self.reid_extractor.compute_similarity(current_features, old_features)
+            
+            # Combined score: weighted average
+            combined_score = (self.reid_weight * reid_score + self.iou_weight * iou_score)
+            
+            # Lưu match tốt nhất
+            if combined_score > best_score:
+                best_score = combined_score
+                best_match = {
                     'old_track_id': old_track_id,
-                    'new_track_id': track_id,
-                    'event': 'RE_ENTRY',
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'iou': f"{iou:.2f}"
+                    'buffer_data': buffer_data,
+                    'iou_score': iou_score,
+                    'reid_score': reid_score,
+                    'combined_score': combined_score
                 }
-                self.logs.append(log_entry)
-                
-                return customer_id, True  # Re-identified
+        
+        # Nếu có match tốt (threshold)
+        if best_match is not None and best_match['combined_score'] >= self.reid_threshold:
+            customer_id = best_match['buffer_data']['customer_id']
+            self.id_mapping[track_id] = customer_id
+            
+            # Restore customer data
+            if customer_id not in self.customers:
+                self.customers[customer_id] = best_match['buffer_data']['customer_data'].copy()
+            
+            # Log với thông tin chi tiết
+            print(f"🔄 ReID: {customer_id} (Track {best_match['old_track_id']} → {track_id}) "
+                  f"[IoU:{best_match['iou_score']:.2f} ReID:{best_match['reid_score']:.3f} "
+                  f"Score:{best_match['combined_score']:.3f}]")
+            
+            # Xóa khỏi buffer
+            del self.track_buffer[best_match['old_track_id']]
+            
+            # Log re-entry
+            log_entry = {
+                'customer_id': customer_id,
+                'old_track_id': int(best_match['old_track_id']),
+                'new_track_id': int(track_id),
+                'event': 'RE_ENTRY',
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'iou': float(best_match['iou_score']),
+                'reid_score': float(best_match['reid_score']),
+                'combined_score': float(best_match['combined_score'])
+            }
+            self.logs.append(log_entry)
+            
+            return customer_id, True  # Re-identified
         
         # Tạo customer mới
         customer_id = f"CUST_{self.next_customer_id:04d}"
@@ -80,12 +343,13 @@ class CustomerTracker:
             'items_detected': set(),
             'exit_time': None,
             'suspicious_count': 0,
-            'last_seen': frame_time
+            'last_seen': frame_time,
+            'feature_history': deque(maxlen=5)  # Keep last 5 features for averaging
         }
         
         log_entry = {
             'customer_id': customer_id,
-            'track_id': track_id,
+            'track_id': int(track_id),
             'event': 'ENTRY',
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'bbox': [float(x) for x in bbox]
@@ -109,14 +373,34 @@ class CustomerTracker:
         
         return intersection / (union + 1e-6)
     
-    def update_customer(self, track_id, bbox, keypoints, items_held, frame_time):
-        """Cập nhật thông tin khách hàng"""
-        customer_id, is_new = self.get_or_create_customer(track_id, bbox, frame_time)
+    def update_customer(self, track_id, bbox, keypoints, items_held, frame_time, frame=None):
+        """Cập nhật thông tin khách hàng
+        
+        Args:
+            track_id: Track ID từ YOLO
+            bbox: Bounding box
+            keypoints: Pose keypoints
+            items_held: List items đang cầm
+            frame_time: Thời gian frame
+            frame: Frame image để extract features (optional)
+        """
+        # Extract features
+        current_features = None
+        if frame is not None:
+            current_features = self.reid_extractor.extract_features(frame, bbox)
+        
+        customer_id, is_new = self.get_or_create_customer(
+            track_id, bbox, frame_time, frame=frame, current_features=current_features
+        )
         
         customer = self.customers[customer_id]
         customer['bbox_history'].append(bbox)
         customer['last_seen'] = frame_time
         customer['track_id'] = track_id  # Update current track_id
+        
+        # Update feature history
+        if current_features is not None:
+            customer['feature_history'].append(current_features)
         
         # Phát hiện cử chỉ lấy hàng
         gesture = self.detect_grabbing_gesture(keypoints, bbox)
@@ -221,12 +505,18 @@ class CustomerTracker:
                     customer = self.customers[customer_id]
                     last_bbox = list(customer['bbox_history'])[-1] if customer['bbox_history'] else None
                     
+                    # Get average features từ feature_history (tốt hơn single feature)
+                    avg_features = None
+                    if customer.get('feature_history') and len(customer['feature_history']) > 0:
+                        avg_features = np.mean(list(customer['feature_history']), axis=0)
+                    
                     # Thêm vào buffer thay vì xóa ngay
                     self.track_buffer[track_id] = {
                         'customer_id': customer_id,
                         'customer_data': customer.copy(),
                         'last_bbox': last_bbox,
-                        'lost_time': frame_time
+                        'lost_time': frame_time,
+                        'features': avg_features  # Lưu average features để ReID
                     }
                     
                     print(f"⏸️  {customer_id} (Track {track_id}) tạm thời mất track")
@@ -252,13 +542,13 @@ class CustomerTracker:
         
         log_entry = {
             'customer_id': customer_id,
-            'track_id': track_id,
+            'track_id': int(track_id),
             'event': 'EXIT',
             'timestamp': customer['exit_time'].strftime('%Y-%m-%d %H:%M:%S'),
-            'duration': f"{duration:.1f}s",
-            'gestures_count': len(customer['gestures']),
+            'duration': float(duration),
+            'gestures_count': int(len(customer['gestures'])),
             'items_detected': list(customer['items_detected']),
-            'suspicious_count': customer['suspicious_count']
+            'suspicious_count': int(customer['suspicious_count'])
         }
         self.logs.append(log_entry)
         
@@ -270,13 +560,24 @@ class CustomerTracker:
             print(f"⚠️  CẢNH BÁO: {customer_id} có {customer['suspicious_count']} hành vi đáng chú ý!")
     
     def save_logs(self, filename='customer_logs.json'):
-        """Lưu logs vào file"""
+        """Lưu logs vào file với JSON serialization đúng"""
         logs_serializable = []
         for log in self.logs:
-            log_copy = log.copy()
-            # Convert set to list if needed
-            if 'items_detected' in log_copy and isinstance(log_copy['items_detected'], set):
-                log_copy['items_detected'] = list(log_copy['items_detected'])
+            log_copy = {}
+            for key, value in log.items():
+                # Convert numpy/torch types to Python native types
+                if isinstance(value, (np.integer, np.int64, np.int32)):
+                    log_copy[key] = int(value)
+                elif isinstance(value, (np.floating, np.float64, np.float32)):
+                    log_copy[key] = float(value)
+                elif isinstance(value, np.ndarray):
+                    log_copy[key] = value.tolist()
+                elif isinstance(value, set):
+                    log_copy[key] = list(value)
+                elif isinstance(value, (datetime,)):
+                    log_copy[key] = value.strftime('%Y-%m-%d %H:%M:%S')
+                else:
+                    log_copy[key] = value
             logs_serializable.append(log_copy)
         
         with open(filename, 'w', encoding='utf-8') as f:
@@ -322,6 +623,7 @@ def main():
     print("\n" + "=" * 70)
     print("🎯 SMART RETAIL TRACKING SYSTEM")
     print("   Tracker: BoT-SORT (Optimized for Occlusion)")
+    print("   ReID: Lightweight (HOG + LAB + Texture)")
     print("   Features: ReID, Motion Prediction, Track Persistence")
     print("=" * 70)
     print("\n📹 Camera đã sẵn sàng!")
@@ -406,9 +708,9 @@ def main():
                                               (int(obj_box[0]), int(obj_box[1]-10)),
                                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
                     
-                    # Cập nhật tracker
+                    # Cập nhật tracker (truyền frame để extract ReID features)
                     customer_id = tracker.update_customer(track_id, box, person_keypoints, 
-                                                         items_held, current_time)
+                                                         items_held, current_time, frame=frame)
                     
                     # Hiển thị Customer ID và thông tin
                     customer = tracker.customers.get(customer_id)
@@ -456,7 +758,7 @@ def main():
                        (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
             # Hiển thị tracker type
-            cv2.putText(annotated_frame, "Tracker: BoT-SORT", 
+            cv2.putText(annotated_frame, "BoT-SORT + Lightweight ReID", 
                        (10, annotated_frame.shape[0] - 10), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             

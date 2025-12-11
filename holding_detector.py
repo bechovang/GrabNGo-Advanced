@@ -1,52 +1,64 @@
 """
-Holding Detection Module
-Detects if a person is holding an object (bottle or snack bag)
-Uses Hybrid approach: Object-based detection + Hand state fallback
+Holding Detection Module - Hand Region Content Analysis
+Detects if a person is holding ANY object by analyzing content in hand region.
+Uses 3 methods: Edge Detection + Mini YOLO + Texture Analysis.
 """
 
 import numpy as np
 import cv2
 from collections import deque
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict
+from ultralytics import YOLO
 
 
 class HoldingDetector:
     """
-    Detects if a person is holding an object using hand keypoints and object detection.
-    Optimized for medium-sized objects (bottles, snack bags).
+    Hand Region Content Analysis: Detects objects in hand region using:
+    1. Edge Detection (detects edges/contours)
+    2. Mini YOLO (object detection in hand region)
+    3. Texture Analysis (variance, patterns)
     """
     
-    def __init__(self):
-        # Object detection settings
-        self.bottle_classes = ['bottle', 'cup', 'wine glass']
-        self.object_confidence_min = 0.25  # Lenient for bags
-        self.medium_object_size_range = (8000, 30000)  # px²
-        
-        # Hand box estimation
-        self.hand_size_ratio = 0.08  # 8% of person height
-        self.hand_extension_vertical = 1.5  # Extend down for bottles
-        
-        # IoU matching
-        self.iou_threshold = 0.12  # Fixed for medium objects
-        
+    def __init__(self, yolo_model_path='yolo11n.pt'):
         # Temporal smoothing
         self.frames_to_confirm_holding = 3  # ~0.1s at 30fps
         self.frames_to_confirm_release = 5  # ~0.17s
         self.decay_rate = 0.5
         
-        # Hand state fallback
-        self.min_hand_state_score = 0.6
-        self.holding_zone_y_range = (0.3, 0.8)  # Relative to person height
-        self.two_hand_max_distance = 150  # px
+        # Combined detection threshold
+        self.min_combined_score = 0.50  # 50% combined score to confirm holding
+        
+        # Feature weights (sum = 1.0)
+        self.weight_edge = 0.40      # 40% - Edge detection
+        self.weight_yolo = 0.35      # 35% - Mini YOLO detection
+        self.weight_texture = 0.25   # 25% - Texture analysis
+        
+        # Edge detection parameters
+        self.edge_density_threshold = 0.15  # 15% edge density = likely holding (default)
+        self.edge_density_threshold_small = 0.12  # 12% for small hand regions (< 1000px²)
+        self.edge_density_threshold_large = 0.18  # 18% for large hand regions (> 2500px²)
+        self.small_region_area = 1000  # Threshold for small region (px²)
+        self.large_region_area = 2500  # Threshold for large region (px²)
+        self.canny_low = 50
+        self.canny_high = 150
+        
+        # Mini YOLO parameters
+        self.yolo_confidence_min = 0.25  # Lower confidence for hand region
+        self.yolo_model = None  # Lazy load
+        self.yolo_model_path = yolo_model_path
+        
+        # Texture analysis parameters
+        self.texture_variance_threshold = 800  # Variance threshold (pixel intensity)
+        self.texture_lbp_threshold = 0.12  # LBP variance threshold
+        
+        # Hand region extraction
+        self.hand_region_width_ratio = 0.24  # 24% of person height (width)
+        self.hand_region_height_ratio = 0.28  # 28% of person height (height)
         
         # Keypoint confidence
         self.min_wrist_confidence = 0.3
         
         # COCO keypoint indices
-        self.LEFT_SHOULDER = 5
-        self.RIGHT_SHOULDER = 6
-        self.LEFT_ELBOW = 7
-        self.RIGHT_ELBOW = 8
         self.LEFT_WRIST = 9
         self.RIGHT_WRIST = 10
         
@@ -57,24 +69,24 @@ class HoldingDetector:
                       customer_id: str,
                       person_bbox: np.ndarray,
                       keypoints: np.ndarray,
-                      detected_objects: List[Dict],
-                      frame: np.ndarray) -> Dict:
+                      detected_objects=None,  # Not used, kept for compatibility
+                      frame: np.ndarray = None) -> Dict:
         """
-        Main detection method. Returns holding status for a person.
+        Hand Region Content Analysis: Detects objects in hand region.
         
         Args:
             customer_id: Customer identifier
             person_bbox: [x1, y1, x2, y2]
             keypoints: YOLO pose keypoints [17, 3] (x, y, confidence)
-            detected_objects: List of detected objects with bbox and class
-            frame: Current frame (for debugging/visualization)
+            detected_objects: Not used (kept for compatibility)
+            frame: Current frame (REQUIRED for hand region analysis)
             
         Returns:
             Dict with:
                 - is_holding: bool
-                - confidence: float
-                - method: str ('object-based', 'hand-state', 'none')
-                - object_class: str or 'unknown'
+                - confidence: float (0.0-1.0)
+                - method: str ('hand-region')
+                - object_class: str ('unknown' - we don't detect object type)
                 - hand_used: str ('left', 'right', 'both', 'unknown')
         """
         # Initialize holding state for new customer
@@ -82,269 +94,348 @@ class HoldingDetector:
             self.holding_states[customer_id] = {
                 'frames_holding': 0,
                 'frames_not_holding': 0,
-                'is_holding': False,
-                'wrist_history': deque(maxlen=10)
+                'is_holding': False
             }
         
         state = self.holding_states[customer_id]
         
-        # Try Method 1: Object-based detection
-        result = self._detect_with_objects(person_bbox, keypoints, detected_objects)
+        # Check if frame is available
+        if frame is None:
+            return {'detected': False, 'confidence': 0.0, 'method': 'hand-region', 
+                   'object_class': 'unknown', 'hand_used': 'unknown'}
         
-        # If no object found, try Method 2: Hand state fallback
-        if not result['detected']:
-            result = self._detect_hand_state(person_bbox, keypoints, state)
+        # Hand Region Content Analysis
+        result = self._analyze_hand_region(person_bbox, keypoints, frame)
         
         # Apply temporal smoothing
         result = self._apply_temporal_smoothing(customer_id, result)
         
         return result
     
-    def _detect_with_objects(self, 
-                            person_bbox: np.ndarray,
-                            keypoints: np.ndarray,
-                            detected_objects: List[Dict]) -> Dict:
-        """Object-based detection using Hand Box + IoU."""
+    def _analyze_hand_region(self,
+                             person_bbox: np.ndarray,
+                             keypoints: np.ndarray,
+                             frame: np.ndarray) -> Dict:
+        """
+        Hand Region Content Analysis: Combines 3 methods.
         
-        # Extract hand keypoints
-        left_wrist = keypoints[self.LEFT_WRIST]
-        right_wrist = keypoints[self.RIGHT_WRIST]
+        1. Edge Detection (40%): Detects edges/contours in hand region
+        2. Mini YOLO (35%): Object detection in hand region
+        3. Texture Analysis (25%): Variance and patterns
+        """
         
-        # DEBUG
-        print(f"      └─> Wrist confidence: L={left_wrist[2]:.2f}, R={right_wrist[2]:.2f}")
+        # Extract hand regions
+        hand_regions = self._extract_hand_regions(person_bbox, keypoints, frame)
         
-        # Check keypoint confidence
-        if left_wrist[2] < self.min_wrist_confidence and right_wrist[2] < self.min_wrist_confidence:
-            print(f"      └─> ❌ Wrist confidence too low (need ≥{self.min_wrist_confidence})")
-            return {'detected': False, 'confidence': 0.0, 'method': 'none'}
+        if not hand_regions:
+            return {'detected': False, 'confidence': 0.0, 'method': 'hand-region',
+                   'object_class': 'unknown', 'hand_used': 'unknown'}
         
-        # Create hand boxes
-        person_height = person_bbox[3] - person_bbox[1]
-        left_hand_box = self._create_hand_box(left_wrist, person_height) if left_wrist[2] >= self.min_wrist_confidence else None
-        right_hand_box = self._create_hand_box(right_wrist, person_height) if right_wrist[2] >= self.min_wrist_confidence else None
-        
-        # Filter relevant objects
-        relevant_objects = self._filter_relevant_objects(detected_objects, person_bbox)
-        
-        # DEBUG
-        print(f"      └─> Filtered {len(relevant_objects)}/{len(detected_objects)} relevant objects")
-        if len(relevant_objects) > 0:
-            print(f"          Objects: {[obj['class'] for obj in relevant_objects]}")
-        
-        # Check IoU for each object
-        best_match = None
-        best_iou = 0.0
+        # Analyze each hand region and take best score
+        best_score = 0.0
         best_hand = 'unknown'
+        all_scores = []
         
-        for obj in relevant_objects:
-            obj_box = obj['bbox']
+        for hand_name, hand_region in hand_regions.items():
+            if hand_region is None or hand_region.size == 0:
+                continue
             
-            # Check left hand
-            if left_hand_box is not None:
-                iou = self._calculate_iou(left_hand_box, obj_box)
-                print(f"          L_hand IoU with {obj['class']}: {iou:.3f} (threshold: {self.iou_threshold})")
-                if iou >= self.iou_threshold and iou > best_iou:
-                    best_iou = iou
-                    best_match = obj
-                    best_hand = 'left'
+            # Method 1: Edge Detection (40% weight)
+            edge_score = self._detect_edges(hand_region)
             
-            # Check right hand
-            if right_hand_box is not None:
-                iou = self._calculate_iou(right_hand_box, obj_box)
-                print(f"          R_hand IoU with {obj['class']}: {iou:.3f} (threshold: {self.iou_threshold})")
-                if iou >= self.iou_threshold and iou > best_iou:
-                    best_iou = iou
-                    best_match = obj
-                    best_hand = 'right'
-        
-        if best_match:
-            print(f"      └─> ✅ Object-based match: {best_match['class']} (IoU={best_iou:.3f}, hand={best_hand})")
-            return {
-                'detected': True,
-                'confidence': best_iou,
-                'method': 'object-based',
-                'object_class': best_match.get('class', 'unknown'),
-                'hand_used': best_hand
-            }
-        
-        print(f"      └─> ❌ No object match, trying hand-state fallback...")
-        return {'detected': False, 'confidence': 0.0, 'method': 'none'}
-    
-    def _detect_hand_state(self,
-                          person_bbox: np.ndarray,
-                          keypoints: np.ndarray,
-                          state: Dict) -> Dict:
-        """Hand state fallback detection."""
-        
-        score = 0.0
-        
-        # Extract keypoints
-        left_shoulder = keypoints[self.LEFT_SHOULDER]
-        right_shoulder = keypoints[self.RIGHT_SHOULDER]
-        left_elbow = keypoints[self.LEFT_ELBOW]
-        right_elbow = keypoints[self.RIGHT_ELBOW]
-        left_wrist = keypoints[self.LEFT_WRIST]
-        right_wrist = keypoints[self.RIGHT_WRIST]
-        
-        # Feature 1: Arm angle (bent arm suggests holding)
-        if left_wrist[2] >= 0.3 and left_elbow[2] >= 0.3 and left_shoulder[2] >= 0.3:
-            angle = self._calculate_angle(left_shoulder[:2], left_elbow[:2], left_wrist[:2])
-            if 60 < angle < 150:
-                score += 0.3
-        
-        if right_wrist[2] >= 0.3 and right_elbow[2] >= 0.3 and right_shoulder[2] >= 0.3:
-            angle = self._calculate_angle(right_shoulder[:2], right_elbow[:2], right_wrist[:2])
-            if 60 < angle < 150:
-                score += 0.3
-        
-        # Feature 2: Hand in holding zone
-        person_height = person_bbox[3] - person_bbox[1]
-        person_top = person_bbox[1]
-        
-        zone_y_min = person_top + person_height * self.holding_zone_y_range[0]
-        zone_y_max = person_top + person_height * self.holding_zone_y_range[1]
-        
-        if left_wrist[2] >= 0.3 and zone_y_min <= left_wrist[1] <= zone_y_max:
-            score += 0.15
-        
-        if right_wrist[2] >= 0.3 and zone_y_min <= right_wrist[1] <= zone_y_max:
-            score += 0.15
-        
-        # Feature 3: Two-hand proximity (holding bag with both hands)
-        if left_wrist[2] >= 0.3 and right_wrist[2] >= 0.3:
-            distance = np.sqrt((left_wrist[0] - right_wrist[0])**2 + 
-                             (left_wrist[1] - right_wrist[1])**2)
-            y_diff = abs(left_wrist[1] - right_wrist[1])
+            # Method 2: Mini YOLO (35% weight)
+            yolo_score = self._detect_with_mini_yolo(hand_region)
             
-            if distance < self.two_hand_max_distance and y_diff < 50:
-                score += 0.2
-        
-        # Feature 4: Wrist stability
-        if left_wrist[2] >= 0.3:
-            state['wrist_history'].append(left_wrist[:2])
-        elif right_wrist[2] >= 0.3:
-            state['wrist_history'].append(right_wrist[:2])
-        
-        if len(state['wrist_history']) >= 5:
-            variance = np.var(state['wrist_history'], axis=0).mean()
-            if variance < 20:  # Stable wrist
-                score += 0.2
+            # Method 3: Texture Analysis (25% weight)
+            texture_score = self._analyze_texture(hand_region)
+            
+            # Combined score
+            combined_score = (self.weight_edge * edge_score +
+                            self.weight_yolo * yolo_score +
+                            self.weight_texture * texture_score)
+            
+            all_scores.append({
+                'hand': hand_name,
+                'edge': edge_score,
+                'yolo': yolo_score,
+                'texture': texture_score,
+                'combined': combined_score
+            })
+            
+            if combined_score > best_score:
+                best_score = combined_score
+                best_hand = hand_name
         
         # Determine hand used
         hand_used = 'unknown'
-        if left_wrist[2] >= 0.3 and right_wrist[2] >= 0.3:
+        if len(hand_regions) == 2:
             hand_used = 'both'
-        elif left_wrist[2] >= 0.3:
+        elif 'left' in hand_regions and hand_regions['left'] is not None:
             hand_used = 'left'
-        elif right_wrist[2] >= 0.3:
+        elif 'right' in hand_regions and hand_regions['right'] is not None:
             hand_used = 'right'
         
         # DEBUG
-        print(f"      └─> Hand-state score: {score:.2f} (threshold: {self.min_hand_state_score})")
+        print(f"      └─> Hand region analysis:")
+        for score_info in all_scores:
+            print(f"          {score_info['hand']}: edge={score_info['edge']:.2f}, "
+                  f"yolo={score_info['yolo']:.2f}, texture={score_info['texture']:.2f}, "
+                  f"combined={score_info['combined']:.2f}")
+        print(f"      └─> Best score: {best_score:.2f} (threshold: {self.min_combined_score})")
         
-        if score >= self.min_hand_state_score:
-            print(f"      └─> ✅ Hand-state match!")
+        if best_score >= self.min_combined_score:
+            print(f"      └─> ✅ Hand region match!")
             return {
                 'detected': True,
-                'confidence': score,
-                'method': 'hand-state',
+                'confidence': best_score,
+                'method': 'hand-region',
                 'object_class': 'unknown',
                 'hand_used': hand_used
             }
         
-        print(f"      └─> ❌ Hand-state below threshold")
-        return {'detected': False, 'confidence': score, 'method': 'none'}
+        print(f"      └─> ❌ Hand region below threshold")
+        return {'detected': False, 'confidence': best_score, 'method': 'hand-region'}
     
-    def _create_hand_box(self, wrist_keypoint: np.ndarray, person_height: float) -> np.ndarray:
-        """Create adaptive hand bounding box around wrist."""
-        wx, wy = wrist_keypoint[0], wrist_keypoint[1]
+    def _extract_hand_regions(self,
+                              person_bbox: np.ndarray,
+                              keypoints: np.ndarray,
+                              frame: np.ndarray) -> Dict[str, np.ndarray]:
+        """Extract hand regions around wrist keypoints."""
+        hand_regions = {}
         
-        hand_size = person_height * self.hand_size_ratio
+        person_height = person_bbox[3] - person_bbox[1]
+        frame_height, frame_width = frame.shape[:2]
         
-        x1 = wx - hand_size
-        y1 = wy - hand_size
-        x2 = wx + hand_size
-        y2 = wy + hand_size * self.hand_extension_vertical
+        # Calculate hand region size
+        region_width = int(person_height * self.hand_region_width_ratio)
+        region_height = int(person_height * self.hand_region_height_ratio)
         
-        return np.array([x1, y1, x2, y2])
+        # Extract left hand region
+        left_wrist = keypoints[self.LEFT_WRIST]
+        if left_wrist[2] >= self.min_wrist_confidence:
+            wx, wy = int(left_wrist[0]), int(left_wrist[1])
+            
+            x1 = max(0, wx - region_width // 2)
+            y1 = max(0, wy - region_height // 4)  # More above wrist
+            x2 = min(frame_width, wx + region_width // 2)
+            y2 = min(frame_height, wy + region_height * 3 // 4)  # More below wrist
+            
+            if x2 > x1 and y2 > y1:
+                hand_regions['left'] = frame[y1:y2, x1:x2]
+            else:
+                hand_regions['left'] = None
+        else:
+            hand_regions['left'] = None
+        
+        # Extract right hand region
+        right_wrist = keypoints[self.RIGHT_WRIST]
+        if right_wrist[2] >= self.min_wrist_confidence:
+            wx, wy = int(right_wrist[0]), int(right_wrist[1])
+            
+            x1 = max(0, wx - region_width // 2)
+            y1 = max(0, wy - region_height // 4)
+            x2 = min(frame_width, wx + region_width // 2)
+            y2 = min(frame_height, wy + region_height * 3 // 4)
+            
+            if x2 > x1 and y2 > y1:
+                hand_regions['right'] = frame[y1:y2, x1:x2]
+            else:
+                hand_regions['right'] = None
+        else:
+            hand_regions['right'] = None
+        
+        return hand_regions
     
-    def _filter_relevant_objects(self, 
-                                detected_objects: List[Dict],
-                                person_bbox: np.ndarray) -> List[Dict]:
-        """Filter objects that could be bottles or bags."""
-        relevant = []
+    def _detect_edges(self, hand_region: np.ndarray) -> float:
+        """
+        Method 1: Edge Detection (Size-Adaptive)
+        Detects edges/contours in hand region.
+        Objects have more edges than just a hand.
         
-        # Expand person bbox for interaction zone
-        interaction_margin = 100
-        interaction_box = [
-            person_bbox[0] - interaction_margin,
-            person_bbox[1],
-            person_bbox[2] + interaction_margin,
-            person_bbox[3]
+        Adaptive threshold based on hand region size:
+        - Small regions (< 1000px²): Lower threshold (0.12) - more lenient
+        - Medium regions (1000-2500px²): Default threshold (0.15)
+        - Large regions (> 2500px²): Higher threshold (0.18) - more strict
+        """
+        if hand_region.size == 0:
+            return 0.0
+        
+        # Convert to grayscale
+        if len(hand_region.shape) == 3:
+            gray = cv2.cvtColor(hand_region, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = hand_region
+        
+        # Calculate region area for adaptive threshold
+        region_area = gray.shape[0] * gray.shape[1]
+        
+        # Determine adaptive threshold based on region size
+        if region_area < self.small_region_area:
+            # Small hand region (person far from camera)
+            adaptive_threshold = self.edge_density_threshold_small  # 0.12 (more lenient)
+            size_category = "small"
+        elif region_area > self.large_region_area:
+            # Large hand region (person close to camera)
+            adaptive_threshold = self.edge_density_threshold_large  # 0.18 (more strict)
+            size_category = "large"
+        else:
+            # Medium hand region
+            adaptive_threshold = self.edge_density_threshold  # 0.15 (default)
+            size_category = "medium"
+        
+        # Resize if too small (for edge detection quality)
+        if gray.shape[0] < 20 or gray.shape[1] < 20:
+            gray = cv2.resize(gray, (40, 40))
+            # Recalculate area after resize
+            region_area = gray.shape[0] * gray.shape[1]
+        
+        # Apply Gaussian blur to reduce noise
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Canny edge detection
+        edges = cv2.Canny(blurred, self.canny_low, self.canny_high)
+        
+        # Calculate edge density
+        edge_pixels = np.sum(edges > 0)
+        total_pixels = edges.size
+        edge_density = edge_pixels / total_pixels if total_pixels > 0 else 0.0
+        
+        # Normalize to 0-1 score using adaptive threshold
+        # Hand alone: 5-10% density
+        # Hand + object: 15-30% density
+        edge_score = min(1.0, edge_density / adaptive_threshold)
+        
+        # DEBUG: Show adaptive threshold info
+        print(f"          Edge: density={edge_density:.3f}, threshold={adaptive_threshold:.3f} ({size_category}, area={region_area}px²), score={edge_score:.2f}")
+        
+        return edge_score
+    
+    def _detect_with_mini_yolo(self, hand_region: np.ndarray) -> float:
+        """
+        Method 3: Mini YOLO Detection
+        Run YOLO detection on hand region only.
+        If ANY object detected (except person) → likely holding.
+        """
+        if hand_region.size == 0:
+            return 0.0
+        
+        # Lazy load YOLO model
+        if self.yolo_model is None:
+            try:
+                self.yolo_model = YOLO(self.yolo_model_path)
+            except Exception as e:
+                print(f"      ⚠️  Could not load YOLO model: {e}")
+                return 0.0
+        
+        # Resize hand region if too small (YOLO needs min size)
+        min_size = 64
+        if hand_region.shape[0] < min_size or hand_region.shape[1] < min_size:
+            scale = max(min_size / hand_region.shape[0], min_size / hand_region.shape[1])
+            new_h = int(hand_region.shape[0] * scale)
+            new_w = int(hand_region.shape[1] * scale)
+            hand_region = cv2.resize(hand_region, (new_w, new_h))
+        
+        try:
+            # Run YOLO on hand region
+            results = self.yolo_model(
+                hand_region,
+                conf=self.yolo_confidence_min,
+                verbose=False
+            )
+            
+            result = results[0]
+            
+            # Check if any objects detected (ignore 'person' class)
+            if result.boxes is not None and len(result.boxes) > 0:
+                classes = result.boxes.cls.cpu().numpy().astype(int)
+                confs = result.boxes.conf.cpu().numpy()
+                class_names = result.names
+                
+                # Find best non-person object
+                best_conf = 0.0
+                for cls, conf in zip(classes, confs):
+                    obj_name = class_names[cls]
+                    if obj_name != 'person':
+                        best_conf = max(best_conf, float(conf))
+                
+                if best_conf > 0:
+                    yolo_score = min(1.0, best_conf / 0.5)  # Normalize to 0-1
+                    return yolo_score
+            
+            return 0.0
+            
+        except Exception as e:
+            # YOLO might fail on very small regions
+            return 0.0
+    
+    def _analyze_texture(self, hand_region: np.ndarray) -> float:
+        """
+        Method 4: Texture Analysis
+        Objects have different texture than skin (variance, patterns).
+        """
+        if hand_region.size == 0:
+            return 0.0
+        
+        # Convert to grayscale
+        if len(hand_region.shape) == 3:
+            gray = cv2.cvtColor(hand_region, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = hand_region
+        
+        # Resize if too small
+        if gray.shape[0] < 20 or gray.shape[1] < 20:
+            gray = cv2.resize(gray, (40, 40))
+        
+        # Method 1: Variance of pixel intensities
+        variance = np.var(gray.astype(np.float32))
+        
+        # Method 2: Local Binary Pattern (LBP) variance
+        # Simple LBP approximation
+        lbp_variance = self._calculate_lbp_variance(gray)
+        
+        # Combine texture scores
+        variance_score = min(1.0, variance / self.texture_variance_threshold)
+        lbp_score = min(1.0, lbp_variance / self.texture_lbp_threshold)
+        
+        texture_score = (variance_score + lbp_score) / 2.0
+        
+        return texture_score
+    
+    def _calculate_lbp_variance(self, gray: np.ndarray) -> float:
+        """Calculate Local Binary Pattern variance (vectorized for speed)."""
+        if gray.shape[0] < 3 or gray.shape[1] < 3:
+            return 0.0
+        
+        # Resize if too large (for speed)
+        if gray.shape[0] > 100 or gray.shape[1] > 100:
+            gray = cv2.resize(gray, (50, 50))
+        
+        h, w = gray.shape
+        
+        # Vectorized LBP calculation
+        center = gray[1:h-1, 1:w-1]
+        
+        # Compare with 8 neighbors
+        neighbors = [
+            gray[0:h-2, 0:w-2],      # top-left
+            gray[0:h-2, 1:w-1],      # top
+            gray[0:h-2, 2:w],        # top-right
+            gray[1:h-1, 2:w],        # right
+            gray[2:h, 2:w],          # bottom-right
+            gray[2:h, 1:w-1],        # bottom
+            gray[2:h, 0:w-2],        # bottom-left
+            gray[1:h-1, 0:w-2]       # left
         ]
         
-        # DEBUG
-        print(f"      └─> Filtering from {len(detected_objects)} objects")
+        # Build LBP code
+        lbp = np.zeros((h-2, w-2), dtype=np.uint8)
+        for i, neighbor in enumerate(neighbors):
+            lbp |= ((neighbor > center).astype(np.uint8) << i)
         
-        for obj in detected_objects:
-            obj_bbox = obj['bbox']
-            obj_class = obj.get('class', '')
-            obj_conf = obj.get('confidence', 0.0)
-            obj_area = (obj_bbox[2] - obj_bbox[0]) * (obj_bbox[3] - obj_bbox[1])
-            
-            # DEBUG: Show each object
-            print(f"          Checking: {obj_class} (conf={obj_conf:.2f}, area={obj_area:.0f})")
-            
-            # Skip if outside interaction zone
-            if not self._boxes_overlap(interaction_box, obj_bbox):
-                print(f"            ❌ Outside interaction zone")
-                continue
-            
-            # Check if it's a bottle
-            if obj_class in self.bottle_classes and obj_conf >= self.object_confidence_min:
-                print(f"            ✓ Bottle match!")
-                relevant.append(obj)
-                continue
-            
-            # Check if it's a medium-sized object (could be bag)
-            if (self.medium_object_size_range[0] <= obj_area <= self.medium_object_size_range[1] 
-                and obj_conf >= 0.2):
-                print(f"            ✓ Medium object match!")
-                relevant.append(obj)
-            else:
-                print(f"            ❌ Not bottle and not medium-sized")
+        # Calculate variance of LBP codes
+        lbp_variance = np.var(lbp.astype(np.float32))
         
-        return relevant
-    
-    def _calculate_iou(self, box1: np.ndarray, box2: np.ndarray) -> float:
-        """Calculate Intersection over Union."""
-        x1 = max(box1[0], box2[0])
-        y1 = max(box1[1], box2[1])
-        x2 = min(box1[2], box2[2])
-        y2 = min(box1[3], box2[3])
-        
-        intersection = max(0, x2 - x1) * max(0, y2 - y1)
-        
-        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-        union = area1 + area2 - intersection + 1e-8
-        
-        return intersection / union
-    
-    def _boxes_overlap(self, box1, box2) -> bool:
-        """Quick check if two boxes overlap."""
-        return not (box1[2] < box2[0] or box1[0] > box2[2] or
-                   box1[3] < box2[1] or box1[1] > box2[3])
-    
-    def _calculate_angle(self, p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
-        """Calculate angle at p2 formed by p1-p2-p3."""
-        v1 = p1 - p2
-        v2 = p3 - p2
-        
-        cosine = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8)
-        angle = np.arccos(np.clip(cosine, -1.0, 1.0))
-        
-        return np.degrees(angle)
+        return lbp_variance
     
     def _apply_temporal_smoothing(self, customer_id: str, detection_result: Dict) -> Dict:
         """Apply temporal smoothing to reduce flickering."""
@@ -365,14 +456,17 @@ class HoldingDetector:
         if state['frames_holding'] >= self.frames_to_confirm_holding:
             state['is_holding'] = True
             detection_result['is_holding'] = True
+            detection_result['status'] = 'confirmed_holding'  # For display
             print(f"      └─> ✅ CONFIRMED HOLDING!")
         elif state['frames_not_holding'] >= self.frames_to_confirm_release:
             state['is_holding'] = False
             detection_result['is_holding'] = False
+            detection_result['status'] = 'confirmed_not_holding'  # For display
             print(f"      └─> ❌ CONFIRMED NOT HOLDING")
         else:
             # Keep previous state during transition
             detection_result['is_holding'] = state['is_holding']
+            detection_result['status'] = 'transitioning'  # For display
             print(f"      └─> ⏳ Transitioning... (keeping previous: {state['is_holding']})")
         
         return detection_result
@@ -389,38 +483,40 @@ class HoldingDetector:
         color = (0, 255, 0) if holding_result.get('is_holding') else (128, 128, 128)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         
-        # Draw hand keypoints
+        # Draw hand keypoints and hand regions
         left_wrist = keypoints[self.LEFT_WRIST]
         right_wrist = keypoints[self.RIGHT_WRIST]
         
-        if left_wrist[2] >= 0.3:
-            cv2.circle(frame, (int(left_wrist[0]), int(left_wrist[1])), 5, (255, 0, 0), -1)
+        person_height = person_bbox[3] - person_bbox[1]
+        region_width = int(person_height * self.hand_region_width_ratio)
+        region_height = int(person_height * self.hand_region_height_ratio)
         
-        if right_wrist[2] >= 0.3:
-            cv2.circle(frame, (int(right_wrist[0]), int(right_wrist[1])), 5, (0, 0, 255), -1)
+        # Draw left hand region
+        if left_wrist[2] >= self.min_wrist_confidence:
+            wx, wy = int(left_wrist[0]), int(left_wrist[1])
+            hx1 = max(0, wx - region_width // 2)
+            hy1 = max(0, wy - region_height // 4)
+            hx2 = min(frame.shape[1], wx + region_width // 2)
+            hy2 = min(frame.shape[0], wy + region_height * 3 // 4)
+            cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), (255, 0, 0), 2)  # Blue for left
+            cv2.circle(frame, (wx, wy), 5, (255, 0, 0), -1)
         
-        # Draw hand boxes
-        if left_wrist[2] >= 0.3:
-            person_height = person_bbox[3] - person_bbox[1]
-            hand_box = self._create_hand_box(left_wrist, person_height)
-            hx1, hy1, hx2, hy2 = map(int, hand_box)
-            cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), (255, 0, 0), 1)
-        
-        if right_wrist[2] >= 0.3:
-            person_height = person_bbox[3] - person_bbox[1]
-            hand_box = self._create_hand_box(right_wrist, person_height)
-            hx1, hy1, hx2, hy2 = map(int, hand_box)
-            cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), (0, 0, 255), 1)
+        # Draw right hand region
+        if right_wrist[2] >= self.min_wrist_confidence:
+            wx, wy = int(right_wrist[0]), int(right_wrist[1])
+            hx1 = max(0, wx - region_width // 2)
+            hy1 = max(0, wy - region_height // 4)
+            hx2 = min(frame.shape[1], wx + region_width // 2)
+            hy2 = min(frame.shape[0], wy + region_height * 3 // 4)
+            cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), (0, 0, 255), 2)  # Red for right
+            cv2.circle(frame, (wx, wy), 5, (0, 0, 255), -1)
         
         # Draw holding status
         status_text = f"Holding: {holding_result.get('is_holding', False)}"
-        method_text = f"Method: {holding_result.get('method', 'none')}"
-        conf_text = f"Conf: {holding_result.get('confidence', 0.0):.2f}"
+        conf_text = f"Score: {holding_result.get('confidence', 0.0):.2f}"
         
-        cv2.putText(frame, status_text, (x1, y1 - 40), 
+        cv2.putText(frame, status_text, (x1, y1 - 20), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        cv2.putText(frame, method_text, (x1, y1 - 20), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
         cv2.putText(frame, conf_text, (x1, y1 - 5), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
         

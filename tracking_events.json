@@ -3,36 +3,84 @@
     "event": "ENTRY",
     "customer_id": "CUST_0001",
     "track_id": 1,
-    "timestamp": "2025-12-11T12:26:13.144925",
+    "timestamp": "2025-12-11T13:44:28.724088",
     "location": {
-      "x": 286.7310485839844,
-      "y": 275.0021667480469
+      "x": 538.7935180664062,
+      "y": 104.328369140625
     }
+  },
+  {
+    "event": "STARTED_HOLDING",
+    "customer_id": "CUST_0001",
+    "track_id": 1,
+    "timestamp": "2025-12-11T13:44:33.264513",
+    "method": "hand-region",
+    "confidence": 0.5574499932454603
+  },
+  {
+    "event": "EXIT",
+    "customer_id": "CUST_0001",
+    "track_id": 1,
+    "timestamp": "2025-12-11T13:44:40.746079",
+    "duration_seconds": 5.013779,
+    "suspicious_count": 0
   },
   {
     "event": "ENTRY",
     "customer_id": "CUST_0002",
     "track_id": 2,
-    "timestamp": "2025-12-11T12:26:17.809519",
+    "timestamp": "2025-12-11T13:44:53.625581",
     "location": {
-      "x": 0.21938680112361908,
-      "y": 387.4106750488281
+      "x": 0.47210681438446045,
+      "y": 484.8561096191406
     }
   },
   {
+    "event": "ENTRY",
+    "customer_id": "CUST_0003",
+    "track_id": 4,
+    "timestamp": "2025-12-11T13:44:54.532509",
+    "location": {
+      "x": 507.062744140625,
+      "y": 33.85288619995117
+    }
+  },
+  {
+    "event": "STARTED_HOLDING",
+    "customer_id": "CUST_0003",
+    "track_id": 4,
+    "timestamp": "2025-12-11T13:45:01.484783",
+    "method": "hand-region",
+    "confidence": 0.659866079521798
+  },
+  {
     "event": "STOPPED_HOLDING",
-    "customer_id": "CUST_0001",
-    "track_id": 8,
-    "timestamp": "2025-12-11T12:27:00.997972",
-    "duration_seconds": 5.105057,
-    "suspicious_count": 0
+    "customer_id": "CUST_0003",
+    "track_id": 4,
+    "timestamp": "2025-12-11T13:45:02.529597"
+  },
+  {
+    "event": "STARTED_HOLDING",
+    "customer_id": "CUST_0003",
+    "track_id": 4,
+    "timestamp": "2025-12-11T13:45:05.527515",
+    "method": "hand-region",
+    "confidence": 0.5496920161099266
   },
   {
     "event": "EXIT",
     "customer_id": "CUST_0002",
-    "track_id": 25,
-    "timestamp": "2025-12-11T12:28:36.826804",
-    "duration_seconds": 5.022905,
+    "track_id": 2,
+    "timestamp": "2025-12-11T13:45:13.504399",
+    "duration_seconds": 26.816539,
+    "suspicious_count": 0
+  },
+  {
+    "event": "EXIT",
+    "customer_id": "CUST_0003",
+    "track_id": 4,
+    "timestamp": "2025-12-11T13:45:13.504399",
+    "duration_seconds": 20.190425,
     "suspicious_count": 0
   }
 ]

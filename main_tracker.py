@@ -200,7 +200,7 @@ class RetailCustomerTracker:
         print(f"✅ Tracker ready | Device: {device}")
         print(f"   Model: {detection_model}")
         print(f"   Config: {tracker_config}")
-        print(f"   Holding detection: Enabled (bottles & snack bags)")
+        print(f"   Holding detection: Hand Region Analysis (Edge + YOLO + Texture)")
     
     def process_frame(self, frame, conf=0.6, iou=0.5, return_annotated=True):
         """
@@ -215,7 +215,7 @@ class RetailCustomerTracker:
         Returns:
             tuple: (results, annotated_frame or None, track_ids_this_frame)
         """
-        # Run YOLO tracking with BoT-SORT + ReID (for people)
+        # Run YOLO tracking with BoT-SORT + ReID (for people with pose)
         # persist=True is CRUCIAL for track continuity
         results = self.model.track(
             frame,
@@ -228,27 +228,8 @@ class RetailCustomerTracker:
             classes=[0]  # Only detect person class for tracking
         )
         
-        # Run YOLO detection for objects (bottles, etc.) without tracking
-        # Use a standard detection model for objects (not pose model)
-        if not hasattr(self, 'object_model'):
-            self.object_model = YOLO('yolo11n.pt')  # Standard detection model for objects
-        
-        object_results = self.object_model(
-            frame,
-            conf=0.20,  # Lower confidence for objects (was 0.25)
-            verbose=False,
-            device=self.device
-        )
-        
         result = results[0]
         current_track_ids = set()
-        
-        # Extract detected objects for holding detection
-        detected_objects = self._extract_objects(object_results[0])
-        
-        # DEBUG: Show detected objects
-        if len(detected_objects) > 0:
-            print(f"🔍 DEBUG | Detected {len(detected_objects)} objects: {[obj['class'] for obj in detected_objects]}")
         
         # Process person detections
         if result.boxes is not None and result.boxes.id is not None:
@@ -266,7 +247,7 @@ class RetailCustomerTracker:
             for idx, (track_id, box, conf_score) in enumerate(zip(track_ids, boxes, confs)):
                 current_track_ids.add(int(track_id))
                 person_keypoints = keypoints[idx] if keypoints is not None else None
-                self._update_track(int(track_id), box, conf_score, frame, person_keypoints, detected_objects)
+                self._update_track(int(track_id), box, conf_score, frame, person_keypoints, None)
         
         # Handle lost tracks (occlusion detection)
         self._handle_occlusions(current_track_ids)
@@ -284,27 +265,6 @@ class RetailCustomerTracker:
             annotated_frame = self._draw_holding_status(annotated_frame)
         
         return result, annotated_frame, list(current_track_ids)
-    
-    def _extract_objects(self, result):
-        """Extract detected objects (bottles, bags) from YOLO result."""
-        objects = []
-        
-        if result.boxes is None:
-            return objects
-        
-        boxes = result.boxes.xyxy.cpu().numpy()
-        classes = result.boxes.cls.cpu().numpy().astype(int)
-        confs = result.boxes.conf.cpu().numpy()
-        class_names = result.names
-        
-        for box, cls, conf in zip(boxes, classes, confs):
-            objects.append({
-                'bbox': box,
-                'class': class_names[cls],
-                'confidence': float(conf)
-            })
-        
-        return objects
     
     def _update_track(self, track_id, box, conf, frame, keypoints=None, detected_objects=None):
         """Update or create tracking information for a track."""
@@ -374,18 +334,17 @@ class RetailCustomerTracker:
         center_y = (box[1] + box[3]) / 2
         self.track_history[track_id].append((center_x, center_y))
         
-        # Holding Detection (for confirmed customers only)
-        if keypoints is not None and detected_objects is not None:
+        # Holding Detection (for confirmed customers only) - Pure Hand-State
+        if keypoints is not None:
             # DEBUG: Show holding detection is running
             print(f"🔍 DEBUG | Running holding detection for {customer['customer_id']}")
             print(f"   Keypoints shape: {keypoints.shape}")
-            print(f"   Objects count: {len(detected_objects)}")
             
             holding_result = self.holding_detector.detect_holding(
                 customer_id=customer['customer_id'],
                 person_bbox=box,
                 keypoints=keypoints,
-                detected_objects=detected_objects,
+                detected_objects=None,  # Not used in pure hand-state
                 frame=frame
             )
             
@@ -406,11 +365,10 @@ class RetailCustomerTracker:
                         'customer_id': customer['customer_id'],
                         'track_id': track_id,
                         'timestamp': datetime.now().isoformat(),
-                        'method': holding_result.get('method'),
-                        'object_class': holding_result.get('object_class', 'unknown'),
+                        'method': holding_result.get('method', 'hand-state'),
                         'confidence': holding_result.get('confidence', 0.0)
                     })
-                    print(f"🤚 Holding | {customer['customer_id']} started holding [{holding_result.get('object_class', 'unknown')}]")
+                    print(f"🤚 Holding | {customer['customer_id']} started holding")
                 customer['was_holding'] = True
             else:
                 if customer.get('was_holding', False):
@@ -425,10 +383,7 @@ class RetailCustomerTracker:
                 customer['was_holding'] = False
         else:
             # DEBUG: Show why holding detection not running
-            if keypoints is None:
-                print(f"⚠️  DEBUG | No keypoints for {customer['customer_id']}")
-            if detected_objects is None:
-                print(f"⚠️  DEBUG | No detected_objects for {customer['customer_id']}")
+            print(f"⚠️  DEBUG | No keypoints for {customer['customer_id']}")
         
         # Clean up lost track entry if customer re-appears
         if track_id in self.lost_tracks:
@@ -807,37 +762,93 @@ class RetailCustomerTracker:
         return frame
     
     def _draw_holding_status(self, frame):
-        """Draw holding status for confirmed customers."""
+        """Draw holding status for confirmed customers with clear visual indicators."""
         for track_id, customer in self.customers.items():
             holding_status = customer.get('holding_status', {})
             
-            if holding_status.get('is_holding'):
-                # Get customer position
-                last_box = customer.get('last_box')
-                if last_box is None:
-                    continue
+            # Skip if no holding status
+            if not holding_status:
+                continue
+            
+            # Get customer position
+            last_box = customer.get('last_box')
+            if last_box is None:
+                continue
+            
+            x1, y1, x2, y2 = map(int, last_box)
+            status = holding_status.get('status', 'transitioning')
+            is_holding = holding_status.get('is_holding', False)
+            conf = holding_status.get('confidence', 0.0)
+            method = holding_status.get('method', 'unknown')
+            
+            # Determine display based on status
+            if status == 'confirmed_holding':
+                # CONFIRMED HOLDING - Green, large text
+                bg_color = (0, 200, 0)  # Green background
+                text_color = (255, 255, 255)  # White text
+                status_text = "✅ CONFIRMED HOLDING"
+                conf_text = f"Score: {conf:.2f}"
+                font_scale = 0.7
+                thickness = 2
+                icon = "🤚"
                 
-                x1, y1, x2, y2 = map(int, last_box)
+            elif status == 'confirmed_not_holding':
+                # CONFIRMED NOT HOLDING - Gray, smaller text
+                bg_color = (100, 100, 100)  # Gray background
+                text_color = (255, 255, 255)  # White text
+                status_text = "❌ NOT HOLDING"
+                conf_text = f"Score: {conf:.2f}"
+                font_scale = 0.5
+                thickness = 1
+                icon = "👐"
                 
-                # Draw holding indicator
-                obj_class = holding_status.get('object_class', 'unknown')
-                method = holding_status.get('method', 'none')
-                conf = holding_status.get('confidence', 0.0)
-                
-                # Icon and text
-                icon = "🤚" if method == 'object-based' else "✋"
-                text = f"{icon} Holding: {obj_class}"
-                
-                # Background for text
-                text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-                cv2.rectangle(frame, (x2 - text_size[0] - 10, y1), (x2, y1 + 25), (255, 0, 0), -1)
-                cv2.putText(frame, text, (x2 - text_size[0] - 5, y1 + 18), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-                
-                # Draw hand indicator (small circle on person bbox)
-                indicator_pos = (x2 - 15, y1 + 15)
-                cv2.circle(frame, indicator_pos, 8, (255, 0, 0), -1)
-                cv2.circle(frame, indicator_pos, 8, (255, 255, 255), 2)
+            else:  # transitioning
+                # TRANSITIONING - Yellow/Orange, medium text
+                bg_color = (0, 165, 255)  # Orange background
+                text_color = (255, 255, 255)  # White text
+                status_text = "⏳ CHECKING..."
+                conf_text = f"Score: {conf:.2f}"
+                font_scale = 0.6
+                thickness = 2
+                icon = "🔍"
+            
+            # Calculate text positions
+            full_text = f"{icon} {status_text}"
+            text_size, _ = cv2.getTextSize(full_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+            conf_size, _ = cv2.getTextSize(conf_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.8, thickness)
+            
+            # Position: Top-right of bounding box
+            text_x = x2 - max(text_size[0], conf_size[0]) - 15
+            text_y = y1 - 10
+            
+            # Draw background rectangle
+            bg_height = text_size[1] + conf_size[1] + 15
+            bg_width = max(text_size[0], conf_size[0]) + 20
+            cv2.rectangle(frame, 
+                         (text_x - 5, text_y - bg_height), 
+                         (x2, text_y + 5), 
+                         bg_color, -1)
+            
+            # Draw border
+            cv2.rectangle(frame, 
+                         (text_x - 5, text_y - bg_height), 
+                         (x2, text_y + 5), 
+                         (255, 255, 255), 2)
+            
+            # Draw status text
+            cv2.putText(frame, full_text, 
+                       (text_x, text_y - conf_size[1] - 5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, thickness)
+            
+            # Draw confidence text
+            cv2.putText(frame, conf_text, 
+                       (text_x, text_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, font_scale * 0.8, text_color, thickness)
+            
+            # Draw indicator circle on bounding box corner
+            indicator_pos = (x2 - 10, y1 + 10)
+            cv2.circle(frame, indicator_pos, 8, bg_color, -1)
+            cv2.circle(frame, indicator_pos, 8, (255, 255, 255), 2)
         
         return frame
     

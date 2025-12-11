@@ -69,6 +69,7 @@ videos/
 images/
 
 # Logs
+*.json
 *.log
 logs/
 tensorboard_logs/

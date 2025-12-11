@@ -2,37 +2,37 @@
   {
     "event": "ENTRY",
     "customer_id": "CUST_0001",
-    "track_id": 1,
-    "timestamp": "2025-12-11T12:26:13.144925",
+    "track_id": 2,
+    "timestamp": "2025-12-11T12:33:17.864897",
     "location": {
-      "x": 286.7310485839844,
-      "y": 275.0021667480469
+      "x": 272.6874694824219,
+      "y": 384.1145324707031
     }
   },
   {
     "event": "ENTRY",
     "customer_id": "CUST_0002",
-    "track_id": 2,
-    "timestamp": "2025-12-11T12:26:17.809519",
+    "track_id": 6,
+    "timestamp": "2025-12-11T12:33:19.293582",
     "location": {
-      "x": 0.21938680112361908,
-      "y": 387.4106750488281
+      "x": 451.51434326171875,
+      "y": 284.8782958984375
     }
   },
   {
     "event": "EXIT",
     "customer_id": "CUST_0001",
-    "track_id": 8,
-    "timestamp": "2025-12-11T12:27:00.997972",
-    "duration_seconds": 5.105057,
+    "track_id": 2,
+    "timestamp": "2025-12-11T12:34:15.241559",
+    "duration_seconds": 66.335276,
     "suspicious_count": 0
   },
   {
     "event": "EXIT",
     "customer_id": "CUST_0002",
-    "track_id": 25,
-    "timestamp": "2025-12-11T12:28:36.826804",
-    "duration_seconds": 5.022905,
+    "track_id": 12,
+    "timestamp": "2025-12-11T12:34:15.241705",
+    "duration_seconds": 62.192016,
     "suspicious_count": 0
   }
 ]

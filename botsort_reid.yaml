@@ -1,0 +1,37 @@
+# BoT-SORT Tracker Config with ReID
+# Save as: botsort_reid.yaml
+
+tracker_type: botsort
+
+# Detection confidence thresholds
+track_high_thresh: 0.6      # High confidence → direct assignment
+track_low_thresh: 0.1       # Low confidence → check in 2nd round
+new_track_thresh: 0.4       # Threshold for initiating new track
+
+# CRITICAL FOR OCCLUSION: Track buffer time
+track_buffer: 60            # Keep lost tracks for 60 frames
+                            # At 30fps = 2 seconds
+                            # Adjust based on max occlusion duration you expect
+
+# Spatial matching
+match_thresh: 0.8           # IoU threshold for track-detection matching
+fuse_score: True            # Fuse confidence score with IoU
+
+# ===== ReID (Re-Identification) - KEY PARAMETERS =====
+with_reid: True             # Enable appearance-based tracking
+model: auto                 # Options:
+                            #   auto = use YOLO native features (FAST)
+                            #   yolo11n-cls.pt = separate classification model (SLOWER but more accurate)
+
+# Appearance-based matching thresholds
+proximity_thresh: 0.5       # Min IoU before considering ReID features
+appearance_thresh: 0.35     # Min cosine similarity for ReID match
+                            # Lower = more lenient (might accept wrong matches)
+                            # Higher = stricter (might miss re-identifications)
+
+# Motion compensation (for camera pan/tilt/zoom)
+gmc_method: sparseOptFlow   # Options: orb, sift, ecc, sparseOptFlow, None
+                            # Helps handle camera movement to improve tracking
+
+# Kalman Filter configuration
+kalman_format: apple        # Apple Kalman filter format

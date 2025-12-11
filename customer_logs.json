@@ -1,148 +1,192 @@
-[
-  {
-    "customer_id": "CUST_0001",
-    "track_id": 1,
-    "event": "ENTRY",
-    "timestamp": "2025-12-11 11:02:54",
-    "bbox": [
-      318.6790771484375,
-      191.1563720703125,
-      1060.6741943359375,
-      717.3660888671875
-    ]
+{
+  "logs": [
+    {
+      "customer_id": "CUST_0001",
+      "track_id": 1,
+      "event": "ENTRY",
+      "timestamp": "2025-12-11 11:21:06",
+      "bbox": [
+        339.168212890625,
+        211.0328369140625,
+        1092.6575927734375,
+        718.5186157226562
+      ]
+    },
+    {
+      "customer_id": "CUST_0002",
+      "track_id": 2,
+      "event": "ENTRY",
+      "timestamp": "2025-12-11 11:21:06",
+      "bbox": [
+        384.93426513671875,
+        403.4486083984375,
+        506.22796630859375,
+        582.780029296875
+      ]
+    },
+    {
+      "customer_id": "CUST_0002",
+      "old_track_id": 2,
+      "new_track_id": 3,
+      "event": "RE_ENTRY",
+      "timestamp": "2025-12-11 11:21:10",
+      "iou": 0.0,
+      "reid_score": 0.8932858591833471,
+      "combined_score": 0.6253001093864441,
+      "adaptive_threshold": 0.25,
+      "feature_quality": 0.3177578046335403
+    },
+    {
+      "customer_id": "CUST_0002",
+      "old_track_id": 3,
+      "new_track_id": 5,
+      "event": "RE_ENTRY",
+      "timestamp": "2025-12-11 11:21:12",
+      "iou": 0.0,
+      "reid_score": 0.7219008604159903,
+      "combined_score": 0.5053306221961975,
+      "adaptive_threshold": 0.25,
+      "feature_quality": 0.31630023565469984
+    },
+    {
+      "customer_id": "CUST_0002",
+      "track_id": 5,
+      "event": "EXIT",
+      "timestamp": "2025-12-11 11:21:18",
+      "duration": 12.524066,
+      "gestures_count": 21,
+      "items_detected": [],
+      "suspicious_count": 21
+    },
+    {
+      "customer_id": "CUST_0002",
+      "old_track_id": 3,
+      "new_track_id": 7,
+      "event": "RE_ENTRY",
+      "timestamp": "2025-12-11 11:21:19",
+      "iou": 0.0,
+      "reid_score": 0.8673667472286504,
+      "combined_score": 0.6071566939353943,
+      "adaptive_threshold": 0.25,
+      "feature_quality": 0.29480678091288565
+    },
+    {
+      "customer_id": "CUST_0002",
+      "old_track_id": 2,
+      "new_track_id": 9,
+      "event": "RE_ENTRY",
+      "timestamp": "2025-12-11 11:21:22",
+      "iou": 0.1560688018798828,
+      "reid_score": 0.8570681753788916,
+      "combined_score": 0.6467683911323547,
+      "adaptive_threshold": 0.25,
+      "feature_quality": 0.2990542126206548
+    },
+    {
+      "customer_id": "CUST_0002",
+      "track_id": 7,
+      "event": "EXIT",
+      "timestamp": "2025-12-11 11:21:25",
+      "duration": 19.530208,
+      "gestures_count": 24,
+      "items_detected": [],
+      "suspicious_count": 24
+    },
+    {
+      "customer_id": "CUST_0002",
+      "track_id": 9,
+      "event": "EXIT",
+      "timestamp": "2025-12-11 11:21:29",
+      "duration": 23.560111,
+      "gestures_count": 40,
+      "items_detected": [],
+      "suspicious_count": 40
+    },
+    {
+      "customer_id": "CUST_0002",
+      "track_id": 2,
+      "event": "EXIT",
+      "timestamp": "2025-12-11 11:21:32",
+      "duration": 26.249865,
+      "gestures_count": 57,
+      "items_detected": [],
+      "suspicious_count": 57
+    },
+    {
+      "customer_id": "CUST_0002",
+      "old_track_id": 9,
+      "new_track_id": 10,
+      "event": "RE_ENTRY",
+      "timestamp": "2025-12-11 11:21:35",
+      "iou": 0.0,
+      "reid_score": 0.8758109481601454,
+      "combined_score": 0.6130676865577698,
+      "adaptive_threshold": 0.25,
+      "feature_quality": 0.2952638005638333
+    },
+    {
+      "customer_id": "CUST_0002",
+      "track_id": 5,
+      "event": "EXIT",
+      "timestamp": "2025-12-11 11:21:36",
+      "duration": 30.606544,
+      "gestures_count": 71,
+      "items_detected": [],
+      "suspicious_count": 71
+    },
+    {
+      "customer_id": "CUST_0002",
+      "track_id": 5,
+      "event": "EXIT",
+      "timestamp": "2025-12-11 11:21:43",
+      "duration": 37.170676,
+      "gestures_count": 98,
+      "items_detected": [],
+      "suspicious_count": 98
+    },
+    {
+      "customer_id": "CUST_0002",
+      "track_id": 2,
+      "event": "EXIT",
+      "timestamp": "2025-12-11 11:21:43",
+      "duration": 37.316517,
+      "gestures_count": 99,
+      "items_detected": [],
+      "suspicious_count": 99
+    },
+    {
+      "customer_id": "CUST_0002",
+      "track_id": 10,
+      "event": "EXIT",
+      "timestamp": "2025-12-11 11:21:43",
+      "duration": 37.316517,
+      "gestures_count": 99,
+      "items_detected": [],
+      "suspicious_count": 99
+    },
+    {
+      "customer_id": "CUST_0002",
+      "track_id": 9,
+      "event": "EXIT",
+      "timestamp": "2025-12-11 11:21:43",
+      "duration": 37.316517,
+      "gestures_count": 99,
+      "items_detected": [],
+      "suspicious_count": 99
+    }
+  ],
+  "metrics": {
+    "reid_success_rate": 1.0,
+    "avg_feature_similarity": 0.8480050982336633,
+    "min_feature_similarity": 0.7219008604159903,
+    "max_feature_similarity": 0.8932858591833471,
+    "avg_track_lifespan": 20.153431574503582,
+    "min_track_lifespan": 4.2825706005096436,
+    "max_track_lifespan": 33.647725343704224,
+    "total_customers": 2,
+    "reid_success_count": 5,
+    "reid_attempt_count": 5,
+    "id_switch_count": 0
   },
-  {
-    "customer_id": "CUST_0002",
-    "track_id": 2,
-    "event": "ENTRY",
-    "timestamp": "2025-12-11 11:03:01",
-    "bbox": [
-      0.0,
-      333.18017578125,
-      90.5355224609375,
-      717.3178100585938
-    ]
-  },
-  {
-    "customer_id": "CUST_0001",
-    "old_track_id": 1,
-    "new_track_id": 3,
-    "event": "RE_ENTRY",
-    "timestamp": "2025-12-11 11:03:11",
-    "iou": 0.14485464990139008,
-    "reid_score": 0.898283940288264,
-    "combined_score": 0.6722551584243774
-  },
-  {
-    "customer_id": "CUST_0002",
-    "old_track_id": 2,
-    "new_track_id": 4,
-    "event": "RE_ENTRY",
-    "timestamp": "2025-12-11 11:03:15",
-    "iou": 0.0,
-    "reid_score": 0.8326388987161477,
-    "combined_score": 0.5828472375869751
-  },
-  {
-    "customer_id": "CUST_0003",
-    "track_id": 5,
-    "event": "ENTRY",
-    "timestamp": "2025-12-11 11:03:17",
-    "bbox": [
-      396.2899169921875,
-      387.4256286621094,
-      537.4736938476562,
-      557.6874389648438
-    ]
-  },
-  {
-    "customer_id": "CUST_0002",
-    "old_track_id": 4,
-    "new_track_id": 6,
-    "event": "RE_ENTRY",
-    "timestamp": "2025-12-11 11:03:18",
-    "iou": 0.0,
-    "reid_score": 0.8738826416572906,
-    "combined_score": 0.6117178201675415
-  },
-  {
-    "customer_id": "CUST_0002",
-    "track_id": 6,
-    "event": "EXIT",
-    "timestamp": "2025-12-11 11:03:22",
-    "duration": 20.691559,
-    "gestures_count": 121,
-    "items_detected": [],
-    "suspicious_count": 121
-  },
-  {
-    "customer_id": "CUST_0003",
-    "old_track_id": 5,
-    "new_track_id": 8,
-    "event": "RE_ENTRY",
-    "timestamp": "2025-12-11 11:03:22",
-    "iou": 0.004543875809758902,
-    "reid_score": 0.9686009886177568,
-    "combined_score": 0.6793838739395142
-  },
-  {
-    "customer_id": "CUST_0002",
-    "track_id": 2,
-    "event": "EXIT",
-    "timestamp": "2025-12-11 11:03:23",
-    "duration": 21.705814,
-    "gestures_count": 128,
-    "items_detected": [],
-    "suspicious_count": 128
-  },
-  {
-    "customer_id": "CUST_0002",
-    "old_track_id": 2,
-    "new_track_id": 9,
-    "event": "RE_ENTRY",
-    "timestamp": "2025-12-11 11:03:26",
-    "iou": 0.2856900095939636,
-    "reid_score": 0.8050185873787579,
-    "combined_score": 0.6492200493812561
-  },
-  {
-    "customer_id": "CUST_0003",
-    "track_id": 8,
-    "event": "EXIT",
-    "timestamp": "2025-12-11 11:03:28",
-    "duration": 10.426523,
-    "gestures_count": 30,
-    "items_detected": [],
-    "suspicious_count": 30
-  },
-  {
-    "customer_id": "CUST_0002",
-    "old_track_id": 2,
-    "new_track_id": 10,
-    "event": "RE_ENTRY",
-    "timestamp": "2025-12-11 11:03:28",
-    "iou": 0.3580295741558075,
-    "reid_score": 0.9377038509271772,
-    "combined_score": 0.7638015747070312
-  },
-  {
-    "customer_id": "CUST_0002",
-    "track_id": 9,
-    "event": "EXIT",
-    "timestamp": "2025-12-11 11:03:29",
-    "duration": 27.763252,
-    "gestures_count": 156,
-    "items_detected": [],
-    "suspicious_count": 156
-  },
-  {
-    "customer_id": "CUST_0002",
-    "track_id": 10,
-    "event": "EXIT",
-    "timestamp": "2025-12-11 11:03:30",
-    "duration": 29.268763,
-    "gestures_count": 164,
-    "items_detected": [],
-    "suspicious_count": 164
-  }
-]
+  "timestamp": "2025-12-11 11:21:43"
+}

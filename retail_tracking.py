@@ -229,17 +229,34 @@ class CustomerTracker:
         # Track history để phát hiện người quay lại
         self.id_mapping = {}  # {old_track_id: customer_id}
         self.track_buffer = {}  # Buffer lưu tracks vừa mất
-        self.max_buffer_time = 3.0  # 3 giây
+        self.max_buffer_time = 5.0  # 5 giây (tăng từ 3s để handle occlusion lâu hơn)
         
         # Lightweight ReID
         print("🔄 Đang khởi tạo Lightweight ReID...")
         self.reid_extractor = LightweightReID()
         print(f"✅ Lightweight ReID đã sẵn sàng (Feature dim: {self.reid_extractor.feature_dim})")
         
-        # ReID parameters
-        self.reid_threshold = 0.45  # Cosine similarity threshold (giảm xuống vì features tốt hơn)
-        self.reid_weight = 0.7  # Weight cho ReID score (tăng vì chính xác hơn)
+        # ReID parameters - Phase 1 Optimized
+        self.base_reid_threshold = 0.35  # Base threshold (giảm để giảm false negatives)
+        self.reid_threshold = 0.35  # Current threshold (có thể adaptive)
+        self.reid_weight = 0.7  # Weight cho ReID score
         self.iou_weight = 0.3  # Weight cho IoU score
+        
+        # Adaptive threshold parameters
+        self.use_adaptive_threshold = True
+        self.min_threshold = 0.25  # Minimum threshold
+        self.max_threshold = 0.50  # Maximum threshold
+        
+        # Performance metrics
+        self.metrics = {
+            'reid_success_count': 0,
+            'reid_attempt_count': 0,
+            'id_switch_count': 0,
+            'total_customers': 0,
+            'feature_similarities': [],
+            'track_lifespans': [],
+            'reid_times': []
+        }
         
     def get_or_create_customer(self, track_id, bbox, frame_time, frame=None, current_features=None):
         """Lấy customer_id từ track_id, hoặc tạo mới nếu chưa có
@@ -262,6 +279,9 @@ class CustomerTracker:
         if current_features is None and frame is not None:
             current_features = self.reid_extractor.extract_features(frame, bbox)
         
+        # Tính feature quality
+        current_feature_quality = self.calculate_feature_quality(current_features)
+        
         # Kiểm tra có phải là người quay lại không (trong buffer)
         best_match = None
         best_score = 0.0
@@ -272,16 +292,33 @@ class CustomerTracker:
                 del self.track_buffer[old_track_id]
                 continue
             
-            # Tính IoU score
+            # Tính IoU score với predicted position nếu có velocity
             old_bbox = buffer_data['last_bbox']
-            iou_score = self.calculate_iou(bbox, old_bbox)
+            time_since_lost = frame_time - buffer_data['lost_time']
+            
+            # Nếu có velocity, predict position
+            if 'velocity' in buffer_data and buffer_data['velocity'] is not None:
+                predicted_bbox = self.predict_bbox_position(
+                    old_bbox, buffer_data['velocity'], time_since_lost
+                )
+                # Use predicted bbox for IoU, but also check original
+                iou_score_predicted = self.calculate_iou(bbox, predicted_bbox)
+                iou_score_original = self.calculate_iou(bbox, old_bbox)
+                iou_score = max(iou_score_predicted, iou_score_original)  # Take better one
+            else:
+                iou_score = self.calculate_iou(bbox, old_bbox)
             
             # Tính ReID score nếu có features
             reid_score = 0.0
+            old_feature_quality = 0.5
             if current_features is not None and 'features' in buffer_data:
                 old_features = buffer_data['features']
                 if old_features is not None:
                     reid_score = self.reid_extractor.compute_similarity(current_features, old_features)
+                    old_feature_quality = self.calculate_feature_quality(old_features)
+                    
+                    # Track similarity for metrics
+                    self.metrics['feature_similarities'].append(reid_score)
             
             # Combined score: weighted average
             combined_score = (self.reid_weight * reid_score + self.iou_weight * iou_score)
@@ -294,11 +331,21 @@ class CustomerTracker:
                     'buffer_data': buffer_data,
                     'iou_score': iou_score,
                     'reid_score': reid_score,
-                    'combined_score': combined_score
+                    'combined_score': combined_score,
+                    'feature_quality': min(current_feature_quality, old_feature_quality)
                 }
         
-        # Nếu có match tốt (threshold)
-        if best_match is not None and best_match['combined_score'] >= self.reid_threshold:
+        # Tính adaptive threshold
+        if best_match is not None:
+            track_age = best_match['buffer_data'].get('track_age', 0.0)
+            adaptive_threshold = self.get_adaptive_threshold(
+                best_match['feature_quality'], track_age
+            )
+        else:
+            adaptive_threshold = self.base_reid_threshold
+        
+        # Nếu có match tốt (adaptive threshold)
+        if best_match is not None and best_match['combined_score'] >= adaptive_threshold:
             customer_id = best_match['buffer_data']['customer_id']
             self.id_mapping[track_id] = customer_id
             
@@ -306,10 +353,14 @@ class CustomerTracker:
             if customer_id not in self.customers:
                 self.customers[customer_id] = best_match['buffer_data']['customer_data'].copy()
             
+            # Update metrics
+            self.metrics['reid_success_count'] += 1
+            self.metrics['reid_attempt_count'] += 1
+            
             # Log với thông tin chi tiết
             print(f"🔄 ReID: {customer_id} (Track {best_match['old_track_id']} → {track_id}) "
                   f"[IoU:{best_match['iou_score']:.2f} ReID:{best_match['reid_score']:.3f} "
-                  f"Score:{best_match['combined_score']:.3f}]")
+                  f"Score:{best_match['combined_score']:.3f} Thresh:{adaptive_threshold:.3f}]")
             
             # Xóa khỏi buffer
             del self.track_buffer[best_match['old_track_id']]
@@ -323,11 +374,17 @@ class CustomerTracker:
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'iou': float(best_match['iou_score']),
                 'reid_score': float(best_match['reid_score']),
-                'combined_score': float(best_match['combined_score'])
+                'combined_score': float(best_match['combined_score']),
+                'adaptive_threshold': float(adaptive_threshold),
+                'feature_quality': float(best_match['feature_quality'])
             }
             self.logs.append(log_entry)
             
             return customer_id, True  # Re-identified
+        
+        # Track attempt (even if failed)
+        if best_match is not None:
+            self.metrics['reid_attempt_count'] += 1
         
         # Tạo customer mới
         customer_id = f"CUST_{self.next_customer_id:04d}"
@@ -344,7 +401,9 @@ class CustomerTracker:
             'exit_time': None,
             'suspicious_count': 0,
             'last_seen': frame_time,
-            'feature_history': deque(maxlen=5)  # Keep last 5 features for averaging
+            'feature_history': deque(maxlen=10),  # Keep last 10 features (tăng từ 5)
+            'velocity': None,  # Velocity for motion prediction [dx, dy]
+            'track_age': 0.0  # Track age in seconds
         }
         
         log_entry = {
@@ -355,9 +414,95 @@ class CustomerTracker:
             'bbox': [float(x) for x in bbox]
         }
         self.logs.append(log_entry)
+        self.metrics['total_customers'] += 1
         print(f"✅ Khách hàng mới: {customer_id} (Track ID: {track_id})")
         
         return customer_id, True  # New customer
+    
+    def calculate_feature_quality(self, features):
+        """Tính feature quality score dựa trên variance và magnitude"""
+        if features is None or len(features) == 0:
+            return 0.0
+        
+        try:
+            # Magnitude (features không nên quá nhỏ)
+            magnitude = np.linalg.norm(features)
+            
+            # Variance (features nên có variation, không phải all zeros)
+            variance = np.var(features)
+            
+            # Quality score: combination of magnitude and variance
+            # Normalize to [0, 1]
+            quality = min(1.0, (magnitude * 0.5 + variance * 100) / 2.0)
+            return float(quality)
+        except:
+            return 0.5  # Default medium quality
+    
+    def get_adaptive_threshold(self, feature_quality, track_age=0.0):
+        """Tính adaptive threshold dựa trên feature quality và track age"""
+        if not self.use_adaptive_threshold:
+            return self.base_reid_threshold
+        
+        # Higher quality features → lower threshold (more confident)
+        # Older tracks → lower threshold (more stable)
+        quality_factor = 1.0 - (feature_quality * 0.2)  # Reduce threshold by up to 20%
+        age_factor = min(0.1, track_age / 10.0)  # Reduce threshold for older tracks
+        
+        adaptive_threshold = self.base_reid_threshold * (1.0 - quality_factor - age_factor)
+        
+        # Clamp to min/max
+        adaptive_threshold = max(self.min_threshold, min(self.max_threshold, adaptive_threshold))
+        
+        return adaptive_threshold
+    
+    def calculate_velocity(self, bbox_history, time_delta):
+        """Tính velocity từ bbox history"""
+        if len(bbox_history) < 2 or time_delta <= 0:
+            return None
+        
+        try:
+            # Lấy 2 bbox gần nhất
+            bbox1 = bbox_history[-2]
+            bbox2 = bbox_history[-1]
+            
+            # Tính center của mỗi bbox
+            center1 = np.array([(bbox1[0] + bbox1[2]) / 2, (bbox1[1] + bbox1[3]) / 2])
+            center2 = np.array([(bbox2[0] + bbox2[2]) / 2, (bbox2[1] + bbox2[3]) / 2])
+            
+            # Velocity = displacement / time
+            velocity = (center2 - center1) / time_delta
+            
+            return velocity
+        except:
+            return None
+    
+    def predict_bbox_position(self, last_bbox, velocity, time_delta):
+        """Dự đoán vị trí bbox dựa trên velocity"""
+        if velocity is None or time_delta <= 0:
+            return last_bbox
+        
+        try:
+            # Tính center của last bbox
+            center = np.array([(last_bbox[0] + last_bbox[2]) / 2, (last_bbox[1] + last_bbox[3]) / 2])
+            
+            # Predict new center
+            predicted_center = center + velocity * time_delta
+            
+            # Tính bbox size
+            bbox_width = last_bbox[2] - last_bbox[0]
+            bbox_height = last_bbox[3] - last_bbox[1]
+            
+            # Tạo predicted bbox
+            predicted_bbox = [
+                predicted_center[0] - bbox_width / 2,
+                predicted_center[1] - bbox_height / 2,
+                predicted_center[0] + bbox_width / 2,
+                predicted_center[1] + bbox_height / 2
+            ]
+            
+            return predicted_bbox
+        except:
+            return last_bbox
     
     def calculate_iou(self, box1, box2):
         """Tính Intersection over Union"""
@@ -394,9 +539,28 @@ class CustomerTracker:
         )
         
         customer = self.customers[customer_id]
+        
+        # Calculate velocity từ bbox history
+        if len(customer['bbox_history']) > 0:
+            last_time = customer.get('last_seen', frame_time)
+            time_delta = frame_time - last_time if last_time > 0 else 0.1
+            velocity = self.calculate_velocity(customer['bbox_history'], time_delta)
+            customer['velocity'] = velocity
+        
         customer['bbox_history'].append(bbox)
         customer['last_seen'] = frame_time
         customer['track_id'] = track_id  # Update current track_id
+        
+        # Update track age
+        if customer.get('entry_time'):
+            entry_timestamp = customer['entry_time']
+            if isinstance(entry_timestamp, datetime):
+                entry_seconds = entry_timestamp.timestamp()
+            else:
+                entry_seconds = entry_timestamp
+            customer['track_age'] = frame_time - entry_seconds
+        else:
+            customer['track_age'] = 0.0
         
         # Update feature history
         if current_features is not None:
@@ -510,13 +674,26 @@ class CustomerTracker:
                     if customer.get('feature_history') and len(customer['feature_history']) > 0:
                         avg_features = np.mean(list(customer['feature_history']), axis=0)
                     
+                    # Calculate track lifespan
+                    track_lifespan = 0.0
+                    if customer.get('entry_time'):
+                        entry_timestamp = customer['entry_time']
+                        if isinstance(entry_timestamp, datetime):
+                            entry_seconds = entry_timestamp.timestamp()
+                        else:
+                            entry_seconds = entry_timestamp
+                        track_lifespan = frame_time - entry_seconds
+                    self.metrics['track_lifespans'].append(track_lifespan)
+                    
                     # Thêm vào buffer thay vì xóa ngay
                     self.track_buffer[track_id] = {
                         'customer_id': customer_id,
                         'customer_data': customer.copy(),
                         'last_bbox': last_bbox,
                         'lost_time': frame_time,
-                        'features': avg_features  # Lưu average features để ReID
+                        'features': avg_features,  # Lưu average features để ReID
+                        'velocity': customer.get('velocity'),  # Lưu velocity để predict
+                        'track_age': customer.get('track_age', 0.0)  # Track age
                     }
                     
                     print(f"⏸️  {customer_id} (Track {track_id}) tạm thời mất track")
@@ -559,6 +736,65 @@ class CustomerTracker:
         if customer['suspicious_count'] > 3:
             print(f"⚠️  CẢNH BÁO: {customer_id} có {customer['suspicious_count']} hành vi đáng chú ý!")
     
+    def get_metrics_summary(self):
+        """Lấy summary của metrics"""
+        summary = {}
+        
+        # ReID success rate
+        if self.metrics['reid_attempt_count'] > 0:
+            summary['reid_success_rate'] = (
+                self.metrics['reid_success_count'] / self.metrics['reid_attempt_count']
+            )
+        else:
+            summary['reid_success_rate'] = 0.0
+        
+        # Average feature similarity
+        if len(self.metrics['feature_similarities']) > 0:
+            summary['avg_feature_similarity'] = np.mean(self.metrics['feature_similarities'])
+            summary['min_feature_similarity'] = np.min(self.metrics['feature_similarities'])
+            summary['max_feature_similarity'] = np.max(self.metrics['feature_similarities'])
+        else:
+            summary['avg_feature_similarity'] = 0.0
+            summary['min_feature_similarity'] = 0.0
+            summary['max_feature_similarity'] = 0.0
+        
+        # Track lifespan statistics
+        if len(self.metrics['track_lifespans']) > 0:
+            summary['avg_track_lifespan'] = np.mean(self.metrics['track_lifespans'])
+            summary['min_track_lifespan'] = np.min(self.metrics['track_lifespans'])
+            summary['max_track_lifespan'] = np.max(self.metrics['track_lifespans'])
+        else:
+            summary['avg_track_lifespan'] = 0.0
+            summary['min_track_lifespan'] = 0.0
+            summary['max_track_lifespan'] = 0.0
+        
+        # Counts
+        summary['total_customers'] = self.metrics['total_customers']
+        summary['reid_success_count'] = self.metrics['reid_success_count']
+        summary['reid_attempt_count'] = self.metrics['reid_attempt_count']
+        summary['id_switch_count'] = self.metrics['id_switch_count']
+        
+        return summary
+    
+    def print_metrics(self):
+        """In metrics summary"""
+        summary = self.get_metrics_summary()
+        
+        print("\n" + "=" * 70)
+        print("📊 PERFORMANCE METRICS SUMMARY")
+        print("=" * 70)
+        print(f"   Total Customers: {summary['total_customers']}")
+        print(f"   ReID Attempts: {summary['reid_attempt_count']}")
+        print(f"   ReID Successes: {summary['reid_success_count']}")
+        if summary['reid_attempt_count'] > 0:
+            print(f"   ReID Success Rate: {summary['reid_success_rate']*100:.1f}%")
+        print(f"   ID Switches: {summary['id_switch_count']}")
+        print(f"   Avg Track Lifespan: {summary['avg_track_lifespan']:.1f}s")
+        if len(self.metrics['feature_similarities']) > 0:
+            print(f"   Avg Feature Similarity: {summary['avg_feature_similarity']:.3f}")
+            print(f"   Min/Max Similarity: {summary['min_feature_similarity']:.3f} / {summary['max_feature_similarity']:.3f}")
+        print("=" * 70 + "\n")
+    
     def save_logs(self, filename='customer_logs.json'):
         """Lưu logs vào file với JSON serialization đúng"""
         logs_serializable = []
@@ -580,9 +816,26 @@ class CustomerTracker:
                     log_copy[key] = value
             logs_serializable.append(log_copy)
         
+        # Add metrics to logs
+        metrics_summary = self.get_metrics_summary()
+        metrics_serializable = {}
+        for key, value in metrics_summary.items():
+            if isinstance(value, (np.integer, np.int64, np.int32)):
+                metrics_serializable[key] = int(value)
+            elif isinstance(value, (np.floating, np.float64, np.float32)):
+                metrics_serializable[key] = float(value)
+            else:
+                metrics_serializable[key] = value
+        
+        output = {
+            'logs': logs_serializable,
+            'metrics': metrics_serializable,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
         with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(logs_serializable, f, ensure_ascii=False, indent=2)
-        print(f"💾 Đã lưu {len(logs_serializable)} logs vào {filename}")
+            json.dump(output, f, ensure_ascii=False, indent=2)
+        print(f"💾 Đã lưu {len(logs_serializable)} logs và metrics vào {filename}")
     
     def is_near(self, person_box, object_box, threshold=150):
         """Kiểm tra vật phẩm có gần người không"""
@@ -621,10 +874,11 @@ def main():
         return
     
     print("\n" + "=" * 70)
-    print("🎯 SMART RETAIL TRACKING SYSTEM")
+    print("🎯 SMART RETAIL TRACKING SYSTEM - PHASE 1 OPTIMIZED")
     print("   Tracker: BoT-SORT (Optimized for Occlusion)")
     print("   ReID: Lightweight (HOG + LAB + Texture)")
     print("   Features: ReID, Motion Prediction, Track Persistence")
+    print("   Phase 1: Adaptive Threshold, Velocity Prediction, Metrics")
     print("=" * 70)
     print("\n📹 Camera đã sẵn sàng!")
     print("💡 Phím tắt:")
@@ -632,6 +886,7 @@ def main():
     print("   l - Xem 10 logs gần nhất")
     print("   s - Lưu logs vào file")
     print("   i - Xem thông tin tracker")
+    print("   m - Xem performance metrics")
     print("=" * 70 + "\n")
     
     frame_count = 0
@@ -668,8 +923,8 @@ def main():
                 verbose=False
             )
             
-            # Vẽ kết quả
-            annotated_frame = pose_results[0].plot()
+            # Vẽ kết quả (tắt labels để chỉ hiển thị Customer ID)
+            annotated_frame = pose_results[0].plot(labels=False)
             
             # Xử lý tracking
             current_tracks = set()
@@ -785,7 +1040,11 @@ def main():
                 print(f"   Total customers served: {tracker.next_customer_id - 1}")
                 print(f"   Total logs: {len(tracker.logs)}")
                 print(f"   ID mappings: {len(tracker.id_mapping)}")
-                print("=" * 70 + "\n")
+                print("=" * 70)
+                tracker.print_metrics()
+            elif key == ord('m'):
+                # Show metrics only
+                tracker.print_metrics()
             
             frame_count += 1
             
@@ -820,6 +1079,8 @@ def main():
             re_entries = len([log for log in tracker.logs if log.get('event') == 'RE_ENTRY'])
             print(f"   Số lần ReID thành công: {re_entries}")
             print("=" * 70)
+            # Print final metrics
+            tracker.print_metrics()
         
         cap.release()
         cv2.destroyAllWindows()

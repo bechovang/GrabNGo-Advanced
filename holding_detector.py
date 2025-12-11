@@ -1,55 +1,64 @@
 """
-Holding Detection Module - Hand Region Content Analysis
-Detects if a person is holding ANY object by analyzing content in hand region.
-Uses 3 methods: Edge Detection + Mini YOLO + Texture Analysis.
+Holding Detection Module - Simplified Approach
+Detects if a person is holding ANY object using:
+1. MediaPipe Hands (finger state detection)
+2. Dominant Color Detection
+3. Color Variance Analysis
 """
 
 import numpy as np
 import cv2
 from collections import deque
 from typing import Optional, Tuple, Dict
-from ultralytics import YOLO
+import mediapipe as mp
 
 
 class HoldingDetector:
     """
-    Hand Region Content Analysis: Detects objects in hand region using:
-    1. Edge Detection (detects edges/contours)
-    2. Mini YOLO (object detection in hand region)
-    3. Texture Analysis (variance, patterns)
+    Simplified Holding Detection using 3 methods:
+    1. MediaPipe Hands (finger state: nắm lại vs mở ra)
+    2. Dominant Color Detection (màu chính trong hand region)
+    3. Color Variance Analysis (độ đa dạng màu sắc)
     """
     
-    def __init__(self, yolo_model_path='yolo11n.pt'):
+    def __init__(self):
         # Temporal smoothing
         self.frames_to_confirm_holding = 3  # ~0.1s at 30fps
         self.frames_to_confirm_release = 5  # ~0.17s
         self.decay_rate = 0.5
         
         # Combined detection threshold
-        self.min_combined_score = 0.50  # 50% combined score to confirm holding
+        self.min_combined_score = 0.50  # 50% combined score to confirm holding (reduced because finger state unreliable)
         
         # Feature weights (sum = 1.0)
-        self.weight_edge = 0.40      # 40% - Edge detection
-        self.weight_yolo = 0.35      # 35% - Mini YOLO detection
-        self.weight_texture = 0.25   # 25% - Texture analysis
+        # Adjusted: Finger state unreliable, so reduce its weight
+        self.weight_finger = 0.30      # 30% - Finger state (nắm lại) - reduced because often fails
+        self.weight_dominant = 0.40    # 40% - Dominant color (increased)
+        self.weight_variance = 0.30   # 30% - Color variance (increased)
         
-        # Edge detection parameters
-        self.edge_density_threshold = 0.15  # 15% edge density = likely holding (default)
-        self.edge_density_threshold_small = 0.12  # 12% for small hand regions (< 1000px²)
-        self.edge_density_threshold_large = 0.18  # 18% for large hand regions (> 2500px²)
-        self.small_region_area = 1000  # Threshold for small region (px²)
-        self.large_region_area = 2500  # Threshold for large region (px²)
-        self.canny_low = 50
-        self.canny_high = 150
+        # MediaPipe Hands setup
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            min_detection_confidence=0.3,  # Lowered from 0.5 to detect more hands
+            min_tracking_confidence=0.3     # Lowered from 0.5
+        )
+        self.mp_drawing = mp.solutions.drawing_utils
         
-        # Mini YOLO parameters
-        self.yolo_confidence_min = 0.25  # Lower confidence for hand region
-        self.yolo_model = None  # Lazy load
-        self.yolo_model_path = yolo_model_path
+        # Finger state detection parameters
+        self.fist_threshold = 0.25  # Distance ratio threshold for "nắm lại" (increased from 0.15)
+        # If fingertips are within 25% of palm distance → nắm lại
+        # Increased because MediaPipe may not detect perfectly in small hand regions
         
-        # Texture analysis parameters
-        self.texture_variance_threshold = 800  # Variance threshold (pixel intensity)
-        self.texture_lbp_threshold = 0.12  # LBP variance threshold
+        # Dominant color parameters
+        self.dominant_color_k = 3  # K-means clusters (skin, object, background)
+        self.skin_color_tolerance = 30  # HSV tolerance for skin color
+        
+        # Color variance parameters
+        self.color_variance_threshold = 1200  # Variance threshold (pixel intensity)
+        # Da: variance thấp (~500-800)
+        # Có object: variance cao (>1200)
         
         # Hand region extraction
         self.hand_region_width_ratio = 0.24  # 24% of person height (width)
@@ -72,21 +81,21 @@ class HoldingDetector:
                       detected_objects=None,  # Not used, kept for compatibility
                       frame: np.ndarray = None) -> Dict:
         """
-        Hand Region Content Analysis: Detects objects in hand region.
+        Simplified Holding Detection using 3 methods.
         
         Args:
             customer_id: Customer identifier
             person_bbox: [x1, y1, x2, y2]
             keypoints: YOLO pose keypoints [17, 3] (x, y, confidence)
             detected_objects: Not used (kept for compatibility)
-            frame: Current frame (REQUIRED for hand region analysis)
+            frame: Current frame (REQUIRED)
             
         Returns:
             Dict with:
                 - is_holding: bool
                 - confidence: float (0.0-1.0)
-                - method: str ('hand-region')
-                - object_class: str ('unknown' - we don't detect object type)
+                - method: str ('finger-color')
+                - object_class: str ('unknown')
                 - hand_used: str ('left', 'right', 'both', 'unknown')
         """
         # Initialize holding state for new customer
@@ -101,34 +110,33 @@ class HoldingDetector:
         
         # Check if frame is available
         if frame is None:
-            return {'detected': False, 'confidence': 0.0, 'method': 'hand-region', 
+            return {'detected': False, 'confidence': 0.0, 'method': 'finger-color', 
                    'object_class': 'unknown', 'hand_used': 'unknown'}
         
-        # Hand Region Content Analysis
-        result = self._analyze_hand_region(person_bbox, keypoints, frame)
+        # Analyze with 3 methods
+        result = self._analyze_holding(person_bbox, keypoints, frame)
         
         # Apply temporal smoothing
         result = self._apply_temporal_smoothing(customer_id, result)
         
         return result
     
-    def _analyze_hand_region(self,
-                             person_bbox: np.ndarray,
-                             keypoints: np.ndarray,
-                             frame: np.ndarray) -> Dict:
+    def _analyze_holding(self,
+                         person_bbox: np.ndarray,
+                         keypoints: np.ndarray,
+                         frame: np.ndarray) -> Dict:
         """
-        Hand Region Content Analysis: Combines 3 methods.
-        
-        1. Edge Detection (40%): Detects edges/contours in hand region
-        2. Mini YOLO (35%): Object detection in hand region
-        3. Texture Analysis (25%): Variance and patterns
+        Analyze holding using 3 methods:
+        1. MediaPipe Hands (finger state)
+        2. Dominant Color Detection
+        3. Color Variance Analysis
         """
         
         # Extract hand regions
         hand_regions = self._extract_hand_regions(person_bbox, keypoints, frame)
         
         if not hand_regions:
-            return {'detected': False, 'confidence': 0.0, 'method': 'hand-region',
+            return {'detected': False, 'confidence': 0.0, 'method': 'finger-color',
                    'object_class': 'unknown', 'hand_used': 'unknown'}
         
         # Analyze each hand region and take best score
@@ -140,25 +148,25 @@ class HoldingDetector:
             if hand_region is None or hand_region.size == 0:
                 continue
             
-            # Method 1: Edge Detection (40% weight)
-            edge_score = self._detect_edges(hand_region)
+            # Method 1: MediaPipe Hands (finger state) - 50% weight
+            finger_score = self._detect_finger_state(hand_region, frame)
             
-            # Method 2: Mini YOLO (35% weight)
-            yolo_score = self._detect_with_mini_yolo(hand_region)
+            # Method 2: Dominant Color Detection - 30% weight
+            dominant_score = self._detect_dominant_color(hand_region)
             
-            # Method 3: Texture Analysis (25% weight)
-            texture_score = self._analyze_texture(hand_region)
+            # Method 3: Color Variance Analysis - 20% weight
+            variance_score = self._analyze_color_variance(hand_region)
             
             # Combined score
-            combined_score = (self.weight_edge * edge_score +
-                            self.weight_yolo * yolo_score +
-                            self.weight_texture * texture_score)
+            combined_score = (self.weight_finger * finger_score +
+                           self.weight_dominant * dominant_score +
+                           self.weight_variance * variance_score)
             
             all_scores.append({
                 'hand': hand_name,
-                'edge': edge_score,
-                'yolo': yolo_score,
-                'texture': texture_score,
+                'finger': finger_score,
+                'dominant': dominant_score,
+                'variance': variance_score,
                 'combined': combined_score
             })
             
@@ -176,25 +184,25 @@ class HoldingDetector:
             hand_used = 'right'
         
         # DEBUG
-        print(f"      └─> Hand region analysis:")
+        print(f"      └─> Holding analysis:")
         for score_info in all_scores:
-            print(f"          {score_info['hand']}: edge={score_info['edge']:.2f}, "
-                  f"yolo={score_info['yolo']:.2f}, texture={score_info['texture']:.2f}, "
+            print(f"          {score_info['hand']}: finger={score_info['finger']:.2f}, "
+                  f"dominant={score_info['dominant']:.2f}, variance={score_info['variance']:.2f}, "
                   f"combined={score_info['combined']:.2f}")
         print(f"      └─> Best score: {best_score:.2f} (threshold: {self.min_combined_score})")
         
         if best_score >= self.min_combined_score:
-            print(f"      └─> ✅ Hand region match!")
+            print(f"      └─> ✅ Holding detected!")
             return {
                 'detected': True,
                 'confidence': best_score,
-                'method': 'hand-region',
+                'method': 'finger-color',
                 'object_class': 'unknown',
                 'hand_used': hand_used
             }
         
-        print(f"      └─> ❌ Hand region below threshold")
-        return {'detected': False, 'confidence': best_score, 'method': 'hand-region'}
+        print(f"      └─> ❌ Below threshold")
+        return {'detected': False, 'confidence': best_score, 'method': 'finger-color'}
     
     def _extract_hand_regions(self,
                               person_bbox: np.ndarray,
@@ -246,132 +254,159 @@ class HoldingDetector:
         
         return hand_regions
     
-    def _detect_edges(self, hand_region: np.ndarray) -> float:
+    def _detect_finger_state(self, hand_region: np.ndarray, full_frame: np.ndarray) -> float:
         """
-        Method 1: Edge Detection (Size-Adaptive)
-        Detects edges/contours in hand region.
-        Objects have more edges than just a hand.
+        Method 1: MediaPipe Hands - Finger State Detection
+        Detects if hand is "nắm lại" (fist) or "mở ra" (open).
         
-        Adaptive threshold based on hand region size:
-        - Small regions (< 1000px²): Lower threshold (0.12) - more lenient
-        - Medium regions (1000-2500px²): Default threshold (0.15)
-        - Large regions (> 2500px²): Higher threshold (0.18) - more strict
+        Returns:
+            float: 1.0 if nắm lại (likely holding), 0.0 if mở ra
         """
         if hand_region.size == 0:
             return 0.0
         
-        # Convert to grayscale
-        if len(hand_region.shape) == 3:
-            gray = cv2.cvtColor(hand_region, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = hand_region
-        
-        # Calculate region area for adaptive threshold
-        region_area = gray.shape[0] * gray.shape[1]
-        
-        # Determine adaptive threshold based on region size
-        if region_area < self.small_region_area:
-            # Small hand region (person far from camera)
-            adaptive_threshold = self.edge_density_threshold_small  # 0.12 (more lenient)
-            size_category = "small"
-        elif region_area > self.large_region_area:
-            # Large hand region (person close to camera)
-            adaptive_threshold = self.edge_density_threshold_large  # 0.18 (more strict)
-            size_category = "large"
-        else:
-            # Medium hand region
-            adaptive_threshold = self.edge_density_threshold  # 0.15 (default)
-            size_category = "medium"
-        
-        # Resize if too small (for edge detection quality)
-        if gray.shape[0] < 20 or gray.shape[1] < 20:
-            gray = cv2.resize(gray, (40, 40))
-            # Recalculate area after resize
-            region_area = gray.shape[0] * gray.shape[1]
-        
-        # Apply Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # Canny edge detection
-        edges = cv2.Canny(blurred, self.canny_low, self.canny_high)
-        
-        # Calculate edge density
-        edge_pixels = np.sum(edges > 0)
-        total_pixels = edges.size
-        edge_density = edge_pixels / total_pixels if total_pixels > 0 else 0.0
-        
-        # Normalize to 0-1 score using adaptive threshold
-        # Hand alone: 5-10% density
-        # Hand + object: 15-30% density
-        edge_score = min(1.0, edge_density / adaptive_threshold)
-        
-        # DEBUG: Show adaptive threshold info
-        print(f"          Edge: density={edge_density:.3f}, threshold={adaptive_threshold:.3f} ({size_category}, area={region_area}px²), score={edge_score:.2f}")
-        
-        return edge_score
-    
-    def _detect_with_mini_yolo(self, hand_region: np.ndarray) -> float:
-        """
-        Method 3: Mini YOLO Detection
-        Run YOLO detection on hand region only.
-        If ANY object detected (except person) → likely holding.
-        """
-        if hand_region.size == 0:
-            return 0.0
-        
-        # Lazy load YOLO model
-        if self.yolo_model is None:
-            try:
-                self.yolo_model = YOLO(self.yolo_model_path)
-            except Exception as e:
-                print(f"      ⚠️  Could not load YOLO model: {e}")
-                return 0.0
-        
-        # Resize hand region if too small (YOLO needs min size)
-        min_size = 64
-        if hand_region.shape[0] < min_size or hand_region.shape[1] < min_size:
-            scale = max(min_size / hand_region.shape[0], min_size / hand_region.shape[1])
-            new_h = int(hand_region.shape[0] * scale)
-            new_w = int(hand_region.shape[1] * scale)
+        # Resize hand region if too small (MediaPipe works better with larger images)
+        min_size = 128  # Minimum size for MediaPipe
+        h, w = hand_region.shape[:2]
+        if h < min_size or w < min_size:
+            scale = max(min_size / h, min_size / w)
+            new_h = int(h * scale)
+            new_w = int(w * scale)
             hand_region = cv2.resize(hand_region, (new_w, new_h))
         
-        try:
-            # Run YOLO on hand region
-            results = self.yolo_model(
-                hand_region,
-                conf=self.yolo_confidence_min,
-                verbose=False
-            )
-            
-            result = results[0]
-            
-            # Check if any objects detected (ignore 'person' class)
-            if result.boxes is not None and len(result.boxes) > 0:
-                classes = result.boxes.cls.cpu().numpy().astype(int)
-                confs = result.boxes.conf.cpu().numpy()
-                class_names = result.names
-                
-                # Find best non-person object
-                best_conf = 0.0
-                for cls, conf in zip(classes, confs):
-                    obj_name = class_names[cls]
-                    if obj_name != 'person':
-                        best_conf = max(best_conf, float(conf))
-                
-                if best_conf > 0:
-                    yolo_score = min(1.0, best_conf / 0.5)  # Normalize to 0-1
-                    return yolo_score
-            
+        # Convert BGR to RGB for MediaPipe
+        hand_rgb = cv2.cvtColor(hand_region, cv2.COLOR_BGR2RGB)
+        
+        # Process with MediaPipe Hands
+        results = self.hands.process(hand_rgb)
+        
+        if not results.multi_hand_landmarks:
+            # No hand detected in region
             return 0.0
-            
-        except Exception as e:
-            # YOLO might fail on very small regions
-            return 0.0
+        
+        # Get first hand (usually the most confident)
+        hand_landmarks = results.multi_hand_landmarks[0]
+        
+        # Get key landmarks
+        # MediaPipe Hands has 21 landmarks:
+        # 0: Wrist
+        # 4: Thumb tip
+        # 8: Index finger tip
+        # 12: Middle finger tip
+        # 16: Ring finger tip
+        # 20: Pinky tip
+        
+        wrist = hand_landmarks.landmark[0]
+        thumb_tip = hand_landmarks.landmark[4]
+        index_tip = hand_landmarks.landmark[8]
+        middle_tip = hand_landmarks.landmark[12]
+        ring_tip = hand_landmarks.landmark[16]
+        pinky_tip = hand_landmarks.landmark[20]
+        
+        # Calculate distances from fingertips to wrist
+        def distance(lm1, lm2):
+            return np.sqrt((lm1.x - lm2.x)**2 + (lm1.y - lm2.y)**2)
+        
+        thumb_dist = distance(thumb_tip, wrist)
+        index_dist = distance(index_tip, wrist)
+        middle_dist = distance(middle_tip, wrist)
+        ring_dist = distance(ring_tip, wrist)
+        pinky_dist = distance(pinky_tip, wrist)
+        
+        # Average distance
+        avg_dist = (thumb_dist + index_dist + middle_dist + ring_dist + pinky_dist) / 5.0
+        
+        # Reference distance (wrist to middle finger MCP - knuckle)
+        # Use middle finger MCP (landmark 9) as reference
+        middle_mcp = hand_landmarks.landmark[9]
+        reference_dist = distance(middle_mcp, wrist)
+        
+        # Normalize by reference distance
+        if reference_dist > 0:
+            normalized_dist = avg_dist / reference_dist
+        else:
+            normalized_dist = 1.0
+        
+        # If normalized distance is small → nắm lại (fist)
+        # If normalized distance is large → mở ra (open)
+        if normalized_dist < self.fist_threshold:
+            # Nắm lại → likely holding
+            finger_score = 1.0
+            print(f"          Finger: NẮM LẠI (dist={normalized_dist:.3f} < {self.fist_threshold})")
+        else:
+            # Mở ra → not holding
+            finger_score = 0.0
+            print(f"          Finger: MỞ RA (dist={normalized_dist:.3f} >= {self.fist_threshold})")
+        
+        return finger_score
     
-    def _analyze_texture(self, hand_region: np.ndarray) -> float:
+    def _detect_dominant_color(self, hand_region: np.ndarray) -> float:
         """
-        Method 4: Texture Analysis
-        Objects have different texture than skin (variance, patterns).
+        Method 2: Dominant Color Detection
+        Finds dominant color in hand region.
+        If dominant color is NOT skin color → likely holding object.
+        
+        Returns:
+            float: 1.0 if dominant color is NOT skin, 0.0 if skin
+        """
+        if hand_region.size == 0:
+            return 0.0
+        
+        # Convert to HSV for better color analysis
+        hsv = cv2.cvtColor(hand_region, cv2.COLOR_BGR2HSV)
+        
+        # Reshape for K-means
+        hsv_flat = hsv.reshape(-1, 3)
+        
+        # Simple K-means (using OpenCV)
+        # Use fewer clusters for speed
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        k = min(self.dominant_color_k, len(hsv_flat))
+        
+        if len(hsv_flat) < k:
+            return 0.0
+        
+        # Run K-means
+        _, labels, centers = cv2.kmeans(
+            hsv_flat.astype(np.float32),
+            k,
+            None,
+            criteria,
+            3,
+            cv2.KMEANS_RANDOM_CENTERS
+        )
+        
+        # Find dominant cluster (most pixels)
+        unique, counts = np.unique(labels, return_counts=True)
+        dominant_idx = unique[np.argmax(counts)]
+        dominant_color = centers[dominant_idx]
+        
+        # Check if dominant color is skin color
+        # Skin color in HSV: H ~0-20, S ~20-255, V ~70-255
+        h, s, v = dominant_color
+        
+        is_skin = (0 <= h <= 20) and (20 <= s <= 255) and (70 <= v <= 255)
+        
+        if is_skin:
+            # Dominant color is skin → not holding
+            dominant_score = 0.0
+            print(f"          Dominant: SKIN COLOR (H={h:.0f}, S={s:.0f}, V={v:.0f})")
+        else:
+            # Dominant color is NOT skin → likely holding
+            dominant_score = 1.0
+            print(f"          Dominant: NON-SKIN COLOR (H={h:.0f}, S={s:.0f}, V={v:.0f})")
+        
+        return dominant_score
+    
+    def _analyze_color_variance(self, hand_region: np.ndarray) -> float:
+        """
+        Method 3: Color Variance Analysis
+        Calculates variance of pixel intensities.
+        Skin: low variance (uniform color)
+        Object: high variance (different colors)
+        
+        Returns:
+            float: 1.0 if high variance (likely object), 0.0 if low variance (skin)
         """
         if hand_region.size == 0:
             return 0.0
@@ -386,56 +421,21 @@ class HoldingDetector:
         if gray.shape[0] < 20 or gray.shape[1] < 20:
             gray = cv2.resize(gray, (40, 40))
         
-        # Method 1: Variance of pixel intensities
+        # Calculate variance of pixel intensities
         variance = np.var(gray.astype(np.float32))
         
-        # Method 2: Local Binary Pattern (LBP) variance
-        # Simple LBP approximation
-        lbp_variance = self._calculate_lbp_variance(gray)
+        # Normalize to 0-1 score
+        # Skin: variance ~500-800
+        # Object: variance >1200
+        if variance >= self.color_variance_threshold:
+            variance_score = 1.0
+            print(f"          Variance: HIGH ({variance:.0f} >= {self.color_variance_threshold}) → likely object")
+        else:
+            # Linear mapping for intermediate values
+            variance_score = min(1.0, variance / self.color_variance_threshold)
+            print(f"          Variance: LOW ({variance:.0f} < {self.color_variance_threshold}) → likely skin")
         
-        # Combine texture scores
-        variance_score = min(1.0, variance / self.texture_variance_threshold)
-        lbp_score = min(1.0, lbp_variance / self.texture_lbp_threshold)
-        
-        texture_score = (variance_score + lbp_score) / 2.0
-        
-        return texture_score
-    
-    def _calculate_lbp_variance(self, gray: np.ndarray) -> float:
-        """Calculate Local Binary Pattern variance (vectorized for speed)."""
-        if gray.shape[0] < 3 or gray.shape[1] < 3:
-            return 0.0
-        
-        # Resize if too large (for speed)
-        if gray.shape[0] > 100 or gray.shape[1] > 100:
-            gray = cv2.resize(gray, (50, 50))
-        
-        h, w = gray.shape
-        
-        # Vectorized LBP calculation
-        center = gray[1:h-1, 1:w-1]
-        
-        # Compare with 8 neighbors
-        neighbors = [
-            gray[0:h-2, 0:w-2],      # top-left
-            gray[0:h-2, 1:w-1],      # top
-            gray[0:h-2, 2:w],        # top-right
-            gray[1:h-1, 2:w],        # right
-            gray[2:h, 2:w],          # bottom-right
-            gray[2:h, 1:w-1],        # bottom
-            gray[2:h, 0:w-2],        # bottom-left
-            gray[1:h-1, 0:w-2]       # left
-        ]
-        
-        # Build LBP code
-        lbp = np.zeros((h-2, w-2), dtype=np.uint8)
-        for i, neighbor in enumerate(neighbors):
-            lbp |= ((neighbor > center).astype(np.uint8) << i)
-        
-        # Calculate variance of LBP codes
-        lbp_variance = np.var(lbp.astype(np.float32))
-        
-        return lbp_variance
+        return variance_score
     
     def _apply_temporal_smoothing(self, customer_id: str, detection_result: Dict) -> Dict:
         """Apply temporal smoothing to reduce flickering."""
@@ -509,7 +509,7 @@ class HoldingDetector:
             hx2 = min(frame.shape[1], wx + region_width // 2)
             hy2 = min(frame.shape[0], wy + region_height * 3 // 4)
             cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), (0, 0, 255), 2)  # Red for right
-            cv2.circle(frame, (wx, wy), 5, (0, 0, 255), -1)
+            cv2.circle(frame, (wx, wy), 5, (0, 0, 0), -1)
         
         # Draw holding status
         status_text = f"Holding: {holding_result.get('is_holding', False)}"
@@ -532,4 +532,3 @@ class HoldingDetector:
         """Reset holding state for a customer (when they exit)."""
         if customer_id in self.holding_states:
             del self.holding_states[customer_id]
-

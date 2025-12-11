@@ -25,8 +25,8 @@ model: yolo11n-cls.pt       # Options:
                             #   Using classification model for better ReID accuracy
 
 # Appearance-based matching thresholds
-proximity_thresh: 0.3       # Min IoU before considering ReID features (giảm từ 0.5)
-appearance_thresh: 0.25     # Min cosine similarity for ReID match (giảm từ 0.35)
+proximity_thresh: 0.2       # Min IoU before considering ReID features (giảm từ 0.5)
+appearance_thresh: 0.1     # Min cosine similarity for ReID match (giảm từ 0.35)
                             # Lower = more lenient (might accept wrong matches)
                             # Higher = stricter (might miss re-identifications)
 
@@ -38,5 +38,5 @@ gmc_method: sparseOptFlow   # Options: orb, sift, ecc, sparseOptFlow, None
 kalman_format: apple        # Apple Kalman filter format
 
 # Track buffer time (frames)
-# 30 FPS → 150 frames ≈ 5s (tăng từ 60)
-track_buffer: 150
+# 30 FPS → 300 frames ≈ 10s (tăng từ 60)
+track_buffer: 300

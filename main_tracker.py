@@ -12,6 +12,7 @@ from collections import defaultdict, deque
 from datetime import datetime
 import numpy as np
 from enum import Enum
+from holding_detector import HoldingDetector
 
 
 class TrackState(Enum):
@@ -149,7 +150,7 @@ class RetailCustomerTracker:
     """
     
     def __init__(self, 
-                 detection_model='yolo11n.pt',
+                 detection_model='yolo11n-pose.pt',  # Changed to pose model
                  tracker_config='botsort_reid.yaml',
                  device='cuda' if torch.cuda.is_available() else 'cpu'):
         """
@@ -190,12 +191,16 @@ class RetailCustomerTracker:
         self.min_confidence_avg = 0.5   # Average confidence >= 0.5
         self.min_feature_quality = 0.3  # At least 30% valid features
         
+        # Holding Detection System
+        self.holding_detector = HoldingDetector()
+        
         # Logs
         self.events = []
         
         print(f"✅ Tracker ready | Device: {device}")
         print(f"   Model: {detection_model}")
         print(f"   Config: {tracker_config}")
+        print(f"   Holding detection: Enabled (bottles & snack bags)")
     
     def process_frame(self, frame, conf=0.6, iou=0.5, return_annotated=True):
         """
@@ -210,7 +215,7 @@ class RetailCustomerTracker:
         Returns:
             tuple: (results, annotated_frame or None, track_ids_this_frame)
         """
-        # Run YOLO tracking with BoT-SORT + ReID
+        # Run YOLO tracking with BoT-SORT + ReID (for people)
         # persist=True is CRUCIAL for track continuity
         results = self.model.track(
             frame,
@@ -219,21 +224,49 @@ class RetailCustomerTracker:
             iou=iou,
             tracker=self.tracker_config,  # ← Use custom ReID config
             verbose=False,
+            device=self.device,
+            classes=[0]  # Only detect person class for tracking
+        )
+        
+        # Run YOLO detection for objects (bottles, etc.) without tracking
+        # Use a standard detection model for objects (not pose model)
+        if not hasattr(self, 'object_model'):
+            self.object_model = YOLO('yolo11n.pt')  # Standard detection model for objects
+        
+        object_results = self.object_model(
+            frame,
+            conf=0.20,  # Lower confidence for objects (was 0.25)
+            verbose=False,
             device=self.device
         )
         
         result = results[0]
         current_track_ids = set()
         
-        # Process detections
+        # Extract detected objects for holding detection
+        detected_objects = self._extract_objects(object_results[0])
+        
+        # DEBUG: Show detected objects
+        if len(detected_objects) > 0:
+            print(f"🔍 DEBUG | Detected {len(detected_objects)} objects: {[obj['class'] for obj in detected_objects]}")
+        
+        # Process person detections
         if result.boxes is not None and result.boxes.id is not None:
             track_ids = result.boxes.id.int().cpu().numpy()
             boxes = result.boxes.xyxy.cpu().numpy()
             confs = result.boxes.conf.cpu().numpy()
+            keypoints = result.keypoints.data.cpu().numpy() if result.keypoints is not None else None
             
-            for track_id, box, conf_score in zip(track_ids, boxes, confs):
+            # DEBUG: Check if keypoints are available
+            if keypoints is None:
+                print(f"⚠️  DEBUG | YOLO result has NO keypoints! Model might not be pose model.")
+            else:
+                print(f"✓ DEBUG | Keypoints available: shape={keypoints.shape}")
+            
+            for idx, (track_id, box, conf_score) in enumerate(zip(track_ids, boxes, confs)):
                 current_track_ids.add(int(track_id))
-                self._update_track(int(track_id), box, conf_score, frame)
+                person_keypoints = keypoints[idx] if keypoints is not None else None
+                self._update_track(int(track_id), box, conf_score, frame, person_keypoints, detected_objects)
         
         # Handle lost tracks (occlusion detection)
         self._handle_occlusions(current_track_ids)
@@ -248,10 +281,32 @@ class RetailCustomerTracker:
         if return_annotated:
             annotated_frame = self._draw_trajectories(annotated_frame)
             annotated_frame = self._draw_pending_tracks(annotated_frame, result)
+            annotated_frame = self._draw_holding_status(annotated_frame)
         
         return result, annotated_frame, list(current_track_ids)
     
-    def _update_track(self, track_id, box, conf, frame):
+    def _extract_objects(self, result):
+        """Extract detected objects (bottles, bags) from YOLO result."""
+        objects = []
+        
+        if result.boxes is None:
+            return objects
+        
+        boxes = result.boxes.xyxy.cpu().numpy()
+        classes = result.boxes.cls.cpu().numpy().astype(int)
+        confs = result.boxes.conf.cpu().numpy()
+        class_names = result.names
+        
+        for box, cls, conf in zip(boxes, classes, confs):
+            objects.append({
+                'bbox': box,
+                'class': class_names[cls],
+                'confidence': float(conf)
+            })
+        
+        return objects
+    
+    def _update_track(self, track_id, box, conf, frame, keypoints=None, detected_objects=None):
         """Update or create tracking information for a track."""
         
         # Extract appearance features
@@ -318,6 +373,62 @@ class RetailCustomerTracker:
         center_x = (box[0] + box[2]) / 2
         center_y = (box[1] + box[3]) / 2
         self.track_history[track_id].append((center_x, center_y))
+        
+        # Holding Detection (for confirmed customers only)
+        if keypoints is not None and detected_objects is not None:
+            # DEBUG: Show holding detection is running
+            print(f"🔍 DEBUG | Running holding detection for {customer['customer_id']}")
+            print(f"   Keypoints shape: {keypoints.shape}")
+            print(f"   Objects count: {len(detected_objects)}")
+            
+            holding_result = self.holding_detector.detect_holding(
+                customer_id=customer['customer_id'],
+                person_bbox=box,
+                keypoints=keypoints,
+                detected_objects=detected_objects,
+                frame=frame
+            )
+            
+            # DEBUG: Show holding result
+            print(f"   Result: is_holding={holding_result.get('is_holding')}, "
+                  f"confidence={holding_result.get('confidence', 0):.2f}, "
+                  f"method={holding_result.get('method')}")
+            
+            # Update customer holding status
+            customer['holding_status'] = holding_result
+            
+            # Log holding events
+            if holding_result.get('is_holding'):
+                if not customer.get('was_holding', False):
+                    # Started holding
+                    self.events.append({
+                        'event': 'STARTED_HOLDING',
+                        'customer_id': customer['customer_id'],
+                        'track_id': track_id,
+                        'timestamp': datetime.now().isoformat(),
+                        'method': holding_result.get('method'),
+                        'object_class': holding_result.get('object_class', 'unknown'),
+                        'confidence': holding_result.get('confidence', 0.0)
+                    })
+                    print(f"🤚 Holding | {customer['customer_id']} started holding [{holding_result.get('object_class', 'unknown')}]")
+                customer['was_holding'] = True
+            else:
+                if customer.get('was_holding', False):
+                    # Stopped holding
+                    self.events.append({
+                        'event': 'STOPPED_HOLDING',
+                        'customer_id': customer['customer_id'],
+                        'track_id': track_id,
+                        'timestamp': datetime.now().isoformat()
+                    })
+                    print(f"👐 Released | {customer['customer_id']} released item")
+                customer['was_holding'] = False
+        else:
+            # DEBUG: Show why holding detection not running
+            if keypoints is None:
+                print(f"⚠️  DEBUG | No keypoints for {customer['customer_id']}")
+            if detected_objects is None:
+                print(f"⚠️  DEBUG | No detected_objects for {customer['customer_id']}")
         
         # Clean up lost track entry if customer re-appears
         if track_id in self.lost_tracks:
@@ -431,6 +542,8 @@ class RetailCustomerTracker:
             'items_detected': set(),
             'last_detection_time': datetime.now(),
             'feature_gallery': pending['feature_gallery'],
+            'holding_status': {},
+            'was_holding': False,
         }
         
         self.events.append({
@@ -516,6 +629,9 @@ class RetailCustomerTracker:
     
     def _finalize_customer(self, track_id, customer_id, duration):
         """Finalize customer exit."""
+        # Clean up holding detector state
+        self.holding_detector.reset_customer(customer_id)
+        
         self.events.append({
             'event': 'EXIT',
             'customer_id': customer_id,
@@ -690,6 +806,41 @@ class RetailCustomerTracker:
         
         return frame
     
+    def _draw_holding_status(self, frame):
+        """Draw holding status for confirmed customers."""
+        for track_id, customer in self.customers.items():
+            holding_status = customer.get('holding_status', {})
+            
+            if holding_status.get('is_holding'):
+                # Get customer position
+                last_box = customer.get('last_box')
+                if last_box is None:
+                    continue
+                
+                x1, y1, x2, y2 = map(int, last_box)
+                
+                # Draw holding indicator
+                obj_class = holding_status.get('object_class', 'unknown')
+                method = holding_status.get('method', 'none')
+                conf = holding_status.get('confidence', 0.0)
+                
+                # Icon and text
+                icon = "🤚" if method == 'object-based' else "✋"
+                text = f"{icon} Holding: {obj_class}"
+                
+                # Background for text
+                text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                cv2.rectangle(frame, (x2 - text_size[0] - 10, y1), (x2, y1 + 25), (255, 0, 0), -1)
+                cv2.putText(frame, text, (x2 - text_size[0] - 5, y1 + 18), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                
+                # Draw hand indicator (small circle on person bbox)
+                indicator_pos = (x2 - 15, y1 + 15)
+                cv2.circle(frame, indicator_pos, 8, (255, 0, 0), -1)
+                cv2.circle(frame, indicator_pos, 8, (255, 255, 255), 2)
+        
+        return frame
+    
     def get_stats(self):
         """Get current tracking statistics."""
         return {
@@ -720,7 +871,7 @@ def main():
     # Initialize tracker
     # Make sure botsort_reid.yaml is in ultralytics/cfg/trackers/
     tracker = RetailCustomerTracker(
-        detection_model='yolo11n.pt',
+        detection_model='yolo11n-pose.pt',  # Use pose model for keypoints
         tracker_config='botsort_reid.yaml'
     )
     

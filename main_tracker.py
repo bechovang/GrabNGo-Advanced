@@ -1,6 +1,7 @@
 """
 Smart Retail Tracking System - Production Ready
 Using BoT-SORT with native ReID (appearance features)
++ Manual Confirmation for New IDs
 """
 
 import torch
@@ -10,6 +11,13 @@ from ultralytics import YOLO
 from collections import defaultdict, deque
 from datetime import datetime
 import numpy as np
+from enum import Enum
+
+
+class TrackState(Enum):
+    """Track states for manual confirmation system."""
+    PENDING = "PENDING"      # Waiting for manual confirmation
+    CONFIRMED = "CONFIRMED"  # Manually confirmed by user
 
 
 class LightweightReID:
@@ -172,6 +180,16 @@ class RetailCustomerTracker:
         self.reid_low_thresh = 0.30   # Stage 2: low confidence
         self.feature_gallery_size = 10
         
+        # Manual Confirmation System
+        self.pending_tracks = {}  # {track_id: {data, first_seen_time}}
+        self.selected_pending_index = 0  # For 1-9 selection
+        self.pending_timeout = 10.0  # Auto-remove pending after 10s
+        
+        # Validation requirements for confirmation
+        self.min_samples_required = 5  # Need 5 feature samples
+        self.min_confidence_avg = 0.5   # Average confidence >= 0.5
+        self.min_feature_quality = 0.3  # At least 30% valid features
+        
         # Logs
         self.events = []
         
@@ -220,12 +238,16 @@ class RetailCustomerTracker:
         # Handle lost tracks (occlusion detection)
         self._handle_occlusions(current_track_ids)
         
-        # Prepare output
-        annotated_frame = result.plot() if return_annotated else None
+        # Cleanup old pending tracks
+        self._cleanup_pending_tracks()
         
-        # Draw trajectory
+        # Prepare output
+        annotated_frame = result.plot(labels=False) if return_annotated else None
+        
+        # Draw trajectory and custom overlays
         if return_annotated:
             annotated_frame = self._draw_trajectories(annotated_frame)
+            annotated_frame = self._draw_pending_tracks(annotated_frame, result)
         
         return result, annotated_frame, list(current_track_ids)
     
@@ -236,37 +258,51 @@ class RetailCustomerTracker:
         features = self.reid.extract_features(frame, box)
 
         # Try ReID with lost tracks before creating new
-        if track_id not in self.customers:
+        if track_id not in self.customers and track_id not in self.pending_tracks:
             matched = self._try_reid(track_id, box, features)
             if matched:
                 customer = matched
                 self.customers[track_id] = customer
                 print(f"🔄 ReID | {customer['customer_id']} (New Track {track_id})")
             else:
-                # New customer
-                customer_id = f"CUST_{self.next_customer_id:04d}"
-                self.next_customer_id += 1
-                self.customers[track_id] = {
-                    'customer_id': customer_id,
+                # Create PENDING track (requires manual confirmation)
+                pending_id = f"PENDING_{track_id:04d}"
+                self.pending_tracks[track_id] = {
+                    'pending_id': pending_id,
                     'track_id': track_id,
-                    'entry_time': datetime.now(),
-                    'entry_box': box,
+                    'state': TrackState.PENDING,
+                    'first_seen': datetime.now(),
+                    'box': box,
+                    'features': features,
                     'confidence_scores': deque(maxlen=30),
-                    'suspicious_count': 0,
-                    'items_detected': set(),
-                    'last_detection_time': datetime.now(),
                     'feature_gallery': deque(maxlen=self.feature_gallery_size),
                 }
-                self.events.append({
-                    'event': 'ENTRY',
-                    'customer_id': customer_id,
-                    'track_id': track_id,
-                    'timestamp': datetime.now().isoformat(),
-                    'location': {'x': float(box[0]), 'y': float(box[1])}
-                })
-                print(f"✅ Entry | {customer_id} (Track {track_id})")
+                # Add initial samples
+                if features is not None:
+                    self.pending_tracks[track_id]['feature_gallery'].append(features)
+                self.pending_tracks[track_id]['confidence_scores'].append(conf)
+                print(f"⏳ Pending | {pending_id} (Track {track_id}) - Collecting info...")
+                return  # Don't update until confirmed
         
-        # Update existing customer
+        # Update existing PENDING track
+        if track_id in self.pending_tracks:
+            pending = self.pending_tracks[track_id]
+            pending['box'] = box
+            pending['confidence_scores'].append(conf)
+            if features is not None:
+                pending['feature_gallery'].append(features)
+            
+            # Check if ready for confirmation
+            is_valid, validation_score, _ = self._validate_pending_track(pending)
+            if is_valid and len(pending['feature_gallery']) == self.min_samples_required:
+                # Just reached minimum - notify user
+                print(f"✓ Ready | {pending['pending_id']} - Can confirm now (Press 'c')")
+            
+            return
+        
+        # Update existing CONFIRMED customer
+        if track_id not in self.customers:
+            return
         customer = self.customers[track_id]
         customer['last_box'] = box
         customer['confidence_scores'].append(conf)
@@ -286,6 +322,158 @@ class RetailCustomerTracker:
         # Clean up lost track entry if customer re-appears
         if track_id in self.lost_tracks:
             del self.lost_tracks[track_id]
+    
+    def _validate_pending_track(self, pending):
+        """
+        Validate if a pending track has enough information for confirmation.
+        
+        Returns:
+            tuple: (is_valid: bool, validation_score: float, issues: list)
+        """
+        issues = []
+        scores = []
+        
+        # 1. Check feature samples count
+        feature_count = len(pending['feature_gallery'])
+        valid_features = sum(1 for f in pending['feature_gallery'] if f is not None)
+        
+        if feature_count < self.min_samples_required:
+            issues.append(f"Need {self.min_samples_required} samples, got {feature_count}")
+            scores.append(feature_count / self.min_samples_required)
+        else:
+            scores.append(1.0)
+        
+        # 2. Check feature quality (% of valid features)
+        if feature_count > 0:
+            feature_quality = valid_features / feature_count
+            if feature_quality < self.min_feature_quality:
+                issues.append(f"Feature quality {feature_quality:.1%} < {self.min_feature_quality:.0%}")
+                scores.append(feature_quality / self.min_feature_quality)
+            else:
+                scores.append(1.0)
+        else:
+            issues.append("No features extracted")
+            scores.append(0.0)
+        
+        # 3. Check detection confidence
+        conf_scores = list(pending['confidence_scores'])
+        if len(conf_scores) > 0:
+            avg_conf = np.mean(conf_scores)
+            if avg_conf < self.min_confidence_avg:
+                issues.append(f"Avg confidence {avg_conf:.2f} < {self.min_confidence_avg:.2f}")
+                scores.append(avg_conf / self.min_confidence_avg)
+            else:
+                scores.append(1.0)
+        else:
+            issues.append("No confidence data")
+            scores.append(0.0)
+        
+        # 4. Check feature consistency (variance)
+        if valid_features >= 3:
+            valid_feats = [f for f in pending['feature_gallery'] if f is not None]
+            feat_array = np.array(valid_feats)
+            feat_std = np.std(feat_array, axis=0).mean()
+            
+            # Lower variance = more consistent (better)
+            consistency_score = max(0, 1.0 - feat_std)  # Normalize
+            if consistency_score < 0.5:
+                issues.append(f"Features inconsistent (var: {feat_std:.3f})")
+                scores.append(consistency_score)
+            else:
+                scores.append(1.0)
+        else:
+            scores.append(0.5)  # Neutral if not enough samples
+        
+        # Overall validation score
+        validation_score = np.mean(scores) if scores else 0.0
+        is_valid = validation_score >= 0.8 and len(issues) == 0
+        
+        return is_valid, validation_score, issues
+    
+    def confirm_pending_track(self, track_id=None):
+        """Confirm a pending track to create a customer ID."""
+        if track_id is None:
+            # Auto-select first pending
+            if not self.pending_tracks:
+                print("⚠️  No pending tracks to confirm")
+                return
+            track_id = list(self.pending_tracks.keys())[self.selected_pending_index % len(self.pending_tracks)]
+        
+        if track_id not in self.pending_tracks:
+            print(f"⚠️  Track {track_id} not in pending")
+            return
+        
+        pending = self.pending_tracks[track_id]
+        
+        # Validate before confirming
+        is_valid, validation_score, issues = self._validate_pending_track(pending)
+        
+        if not is_valid:
+            print(f"❌ Cannot confirm {pending['pending_id']} - Insufficient information:")
+            for issue in issues:
+                print(f"   • {issue}")
+            print(f"   Validation score: {validation_score:.1%} (need ≥80%)")
+            return
+        
+        # Create confirmed customer
+        customer_id = f"CUST_{self.next_customer_id:04d}"
+        self.next_customer_id += 1
+        
+        self.customers[track_id] = {
+            'customer_id': customer_id,
+            'track_id': track_id,
+            'state': TrackState.CONFIRMED,
+            'entry_time': pending['first_seen'],
+            'entry_box': pending['box'],
+            'last_box': pending['box'],
+            'confidence_scores': pending['confidence_scores'],
+            'suspicious_count': 0,
+            'items_detected': set(),
+            'last_detection_time': datetime.now(),
+            'feature_gallery': pending['feature_gallery'],
+        }
+        
+        self.events.append({
+            'event': 'ENTRY',
+            'customer_id': customer_id,
+            'track_id': track_id,
+            'timestamp': datetime.now().isoformat(),
+            'location': {'x': float(pending['box'][0]), 'y': float(pending['box'][1])}
+        })
+        
+        # Remove from pending
+        del self.pending_tracks[track_id]
+        
+        # Report validation details
+        feature_count = len(pending['feature_gallery'])
+        avg_conf = np.mean(pending['confidence_scores']) if pending['confidence_scores'] else 0
+        print(f"✅ Confirmed | {customer_id} (Track {track_id})")
+        print(f"   Validation: {validation_score:.0%} | Samples: {feature_count} | Conf: {avg_conf:.2f}")
+    
+    def select_pending_track(self, index):
+        """Select a pending track by index (1-9)."""
+        if not self.pending_tracks:
+            return
+        self.selected_pending_index = index - 1
+        track_ids = list(self.pending_tracks.keys())
+        if 0 <= self.selected_pending_index < len(track_ids):
+            track_id = track_ids[self.selected_pending_index]
+            pending = self.pending_tracks[track_id]
+            print(f"👉 Selected: {pending['pending_id']}")
+    
+    def _cleanup_pending_tracks(self):
+        """Remove old pending tracks that timeout."""
+        current_time = datetime.now()
+        to_remove = []
+        for track_id, pending in self.pending_tracks.items():
+            age = (current_time - pending['first_seen']).total_seconds()
+            if age > self.pending_timeout:
+                to_remove.append(track_id)
+        
+        for track_id in to_remove:
+            pending = self.pending_tracks[track_id]
+            print(f"⏱️  Timeout | {pending['pending_id']} removed (no confirmation)")
+            del self.pending_tracks[track_id]
     
     def _handle_occlusions(self, current_tracks):
         """
@@ -428,11 +616,86 @@ class RetailCustomerTracker:
         
         return frame
     
+    def _draw_pending_tracks(self, frame, result):
+        """Draw pending tracks with orange color and validation status."""
+        if not self.pending_tracks:
+            return frame
+        
+        # Get boxes and track_ids from result
+        if result.boxes is None or result.boxes.id is None:
+            return frame
+        
+        track_ids = result.boxes.id.int().cpu().numpy()
+        boxes = result.boxes.xyxy.cpu().numpy()
+        
+        for track_id, box in zip(track_ids, boxes):
+            if track_id in self.pending_tracks:
+                pending = self.pending_tracks[track_id]
+                x1, y1, x2, y2 = map(int, box)
+                
+                # Validate track
+                is_valid, validation_score, issues = self._validate_pending_track(pending)
+                
+                # Color based on validation status
+                if is_valid:
+                    color = (0, 255, 0)  # Green = ready to confirm
+                    box_thickness = 3
+                else:
+                    color = (0, 165, 255)  # Orange = collecting info
+                    box_thickness = 2
+                
+                # Draw bounding box
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, box_thickness)
+                
+                # Draw pending ID
+                label = f"{pending['pending_id']}"
+                label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(frame, (x1, y1 - 25), (x1 + label_size[0], y1), color, -1)
+                cv2.putText(frame, label, (x1, y1 - 5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
+                # Draw validation status
+                feature_count = len(pending['feature_gallery'])
+                progress_text = f"Samples: {feature_count}/{self.min_samples_required}"
+                
+                if is_valid:
+                    status_text = f"READY (Press 'c') | {validation_score:.0%}"
+                    status_color = (0, 255, 0)
+                else:
+                    status_text = f"Collecting... | {validation_score:.0%}"
+                    status_color = (0, 165, 255)
+                
+                # Draw progress bar
+                bar_width = int((x2 - x1) * 0.8)
+                bar_x = x1 + 10
+                bar_y = y2 + 10
+                bar_height = 15
+                
+                # Background
+                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (50, 50, 50), -1)
+                
+                # Progress fill
+                fill_width = int(bar_width * validation_score)
+                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_width, bar_y + bar_height), status_color, -1)
+                
+                # Border
+                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (255, 255, 255), 1)
+                
+                # Draw status text
+                cv2.putText(frame, progress_text, (bar_x, bar_y - 5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                
+                cv2.putText(frame, status_text, (bar_x, bar_y + bar_height + 15), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, status_color, 1)
+        
+        return frame
+    
     def get_stats(self):
         """Get current tracking statistics."""
         return {
             'active_customers': len(self.customers),
             'occluded_tracks': len(self.lost_tracks),
+            'pending_tracks': len(self.pending_tracks),
             'total_customers': self.next_customer_id - 1,
             'total_events': len(self.events)
         }
@@ -474,7 +737,16 @@ def main():
     fps_list = []
     
     print("📹 Camera ready!")
-    print("   Keys: q=quit, s=save logs, i=info\n")
+    print("\n📋 Validation Requirements:")
+    print(f"   • Min samples: {tracker.min_samples_required} frames")
+    print(f"   • Min confidence: {tracker.min_confidence_avg:.0%}")
+    print(f"   • Min feature quality: {tracker.min_feature_quality:.0%}")
+    print("\n⌨️  Keys:")
+    print("      q = quit")
+    print("      c = confirm selected pending track (if validated)")
+    print("      1-9 = select pending track by number")
+    print("      s = save logs")
+    print("      i = info\n")
     
     try:
         while True:
@@ -494,15 +766,45 @@ def main():
             
             # Display stats
             stats = tracker.get_stats()
+            y_pos = 30
             cv2.putText(annotated_frame, 
-                       f"Active: {stats['active_customers']} | Occluded: {stats['occluded_tracks']} | Total: {stats['total_customers']}", 
-                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                       f"Active: {stats['active_customers']} | Pending: {stats['pending_tracks']} | Occluded: {stats['occluded_tracks']} | Total: {stats['total_customers']}", 
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             
             # FPS
+            y_pos += 30
             fps = 1 / (time.time() - start_time)
             fps_list.append(fps)
             cv2.putText(annotated_frame, f"FPS: {fps:.1f}", 
-                       (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                       (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            # Pending Tracks Panel
+            if tracker.pending_tracks:
+                y_pos += 40
+                cv2.putText(annotated_frame, "PENDING TRACKS:", 
+                           (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+                
+                for idx, (track_id, pending) in enumerate(list(tracker.pending_tracks.items())[:9]):
+                    y_pos += 25
+                    prefix = ">" if idx == tracker.selected_pending_index else " "
+                    age = (datetime.now() - pending['first_seen']).total_seconds()
+                    
+                    # Get validation status
+                    is_valid, validation_score, _ = tracker._validate_pending_track(pending)
+                    status_icon = "✓" if is_valid else "⏳"
+                    
+                    text = f"{prefix} {idx+1}. {pending['pending_id']} ({age:.1f}s) {status_icon}{validation_score:.0%}"
+                    
+                    # Color coding
+                    if idx == tracker.selected_pending_index:
+                        color = (255, 255, 0)  # Yellow = selected
+                    elif is_valid:
+                        color = (0, 255, 0)    # Green = ready
+                    else:
+                        color = (0, 165, 255)  # Orange = collecting
+                    
+                    cv2.putText(annotated_frame, text, 
+                               (10, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
             
             # Show
             cv2.imshow('Retail Tracking - BoT-SORT + ReID', annotated_frame)
@@ -511,6 +813,13 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
+            elif key == ord('c'):
+                # Confirm selected pending track
+                tracker.confirm_pending_track()
+            elif key in [ord(str(i)) for i in range(1, 10)]:
+                # Select pending track 1-9
+                num = int(chr(key))
+                tracker.select_pending_track(num)
             elif key == ord('s'):
                 tracker.save_events()
             elif key == ord('i'):
@@ -523,7 +832,7 @@ def main():
             frame_count += 1
             if frame_count % 30 == 0:
                 avg_fps = sum(fps_list[-30:]) / min(30, len(fps_list))
-                print(f"Frame {frame_count}: FPS={avg_fps:.1f}, Active={stats['active_customers']}, Occluded={stats['occluded_tracks']}")
+                print(f"Frame {frame_count}: FPS={avg_fps:.1f}, Active={stats['active_customers']}, Pending={stats['pending_tracks']}, Occluded={stats['occluded_tracks']}")
     
     except KeyboardInterrupt:
         print("\n⚠️  Interrupted by user")

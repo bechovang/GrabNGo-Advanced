@@ -3,108 +3,36 @@
     "event": "ENTRY",
     "customer_id": "CUST_0001",
     "track_id": 1,
-    "timestamp": "2025-12-11T11:52:27.689861",
+    "timestamp": "2025-12-11T12:26:13.144925",
     "location": {
-      "x": 296.975830078125,
-      "y": 200.44891357421875
+      "x": 286.7310485839844,
+      "y": 275.0021667480469
     }
   },
   {
     "event": "ENTRY",
     "customer_id": "CUST_0002",
     "track_id": 2,
-    "timestamp": "2025-12-11T11:52:27.706509",
+    "timestamp": "2025-12-11T12:26:17.809519",
     "location": {
-      "x": 0.6393890380859375,
-      "y": 297.2755126953125
-    }
-  },
-  {
-    "event": "ENTRY",
-    "customer_id": "CUST_0003",
-    "track_id": 9,
-    "timestamp": "2025-12-11T11:53:23.405531",
-    "location": {
-      "x": 683.5455322265625,
-      "y": 361.3914794921875
+      "x": 0.21938680112361908,
+      "y": 387.4106750488281
     }
   },
   {
     "event": "EXIT",
     "customer_id": "CUST_0001",
     "track_id": 8,
-    "timestamp": "2025-12-11T11:53:27.635538",
-    "duration_seconds": 5.137832,
+    "timestamp": "2025-12-11T12:27:00.997972",
+    "duration_seconds": 5.105057,
     "suspicious_count": 0
-  },
-  {
-    "event": "ENTRY",
-    "customer_id": "CUST_0004",
-    "track_id": 13,
-    "timestamp": "2025-12-11T11:53:34.829289",
-    "location": {
-      "x": 643.5166015625,
-      "y": 361.39801025390625
-    }
-  },
-  {
-    "event": "EXIT",
-    "customer_id": "CUST_0004",
-    "track_id": 13,
-    "timestamp": "2025-12-11T11:53:43.135370",
-    "duration_seconds": 5.037381,
-    "suspicious_count": 0
-  },
-  {
-    "event": "ENTRY",
-    "customer_id": "CUST_0005",
-    "track_id": 15,
-    "timestamp": "2025-12-11T11:53:46.311286",
-    "location": {
-      "x": 376.9763488769531,
-      "y": 313.6327819824219
-    }
-  },
-  {
-    "event": "EXIT",
-    "customer_id": "CUST_0003",
-    "track_id": 14,
-    "timestamp": "2025-12-11T11:53:50.697007",
-    "duration_seconds": 5.064839,
-    "suspicious_count": 0
-  },
-  {
-    "event": "ENTRY",
-    "customer_id": "CUST_0006",
-    "track_id": 17,
-    "timestamp": "2025-12-11T11:53:50.914364",
-    "location": {
-      "x": 295.6513671875,
-      "y": 226.59217834472656
-    }
   },
   {
     "event": "EXIT",
     "customer_id": "CUST_0002",
-    "track_id": 2,
-    "timestamp": "2025-12-11T11:53:50.916180",
-    "duration_seconds": 83.209671,
-    "suspicious_count": 0
-  },
-  {
-    "event": "EXIT",
-    "customer_id": "CUST_0005",
-    "track_id": 15,
-    "timestamp": "2025-12-11T11:53:50.916180",
-    "duration_seconds": 4.604894,
-    "suspicious_count": 0
-  },
-  {
-    "event": "EXIT",
-    "customer_id": "CUST_0006",
-    "track_id": 17,
-    "timestamp": "2025-12-11T11:53:50.916180",
-    "duration_seconds": 0.001816,
+    "track_id": 25,
+    "timestamp": "2025-12-11T12:28:36.826804",
+    "duration_seconds": 5.022905,
     "suspicious_count": 0
   }
 ]

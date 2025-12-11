@@ -72,6 +72,9 @@ images/
 *.log
 logs/
 tensorboard_logs/
+customer_logs.json
+tracking_events.json
+*_logs.json
 
 # Environment variables
 .env

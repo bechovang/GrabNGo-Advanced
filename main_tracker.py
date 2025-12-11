@@ -12,6 +12,128 @@ from datetime import datetime
 import numpy as np
 
 
+class LightweightReID:
+    """Lightweight ReID: LAB color + HOG + texture + edge density."""
+
+    def __init__(self):
+        self.feature_dim = 512
+
+    def extract_features(self, frame, bbox):
+        try:
+            x1, y1, x2, y2 = map(int, bbox)
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(frame.shape[1], x2)
+            y2 = min(frame.shape[0], y2)
+            if x2 <= x1 or y2 <= y1:
+                return None
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                return None
+            crop = cv2.resize(crop, (128, 256))
+            h = crop.shape[0]
+            head = crop[: int(h * 0.3), :]
+            torso = crop[int(h * 0.3) : int(h * 0.7), :]
+            legs = crop[int(h * 0.7) :, :]
+            feats = []
+            for region in (head, torso, legs):
+                feats.append(self._lab(region))
+            for region in (head, torso, legs):
+                feats.append(self._hog(region))
+            for region in (head, torso, legs):
+                feats.append(self._texture(region))
+            for region in (head, torso, legs):
+                feats.append(self._edge_density(region))
+            features = np.concatenate(feats)
+            if len(features) > self.feature_dim:
+                features = features[: self.feature_dim]
+            else:
+                features = np.pad(features, (0, self.feature_dim - len(features)), "constant")
+            features = features / (np.linalg.norm(features) + 1e-8)
+            return features
+        except Exception:
+            return None
+
+    def _lab(self, img):
+        if img.size == 0:
+            return np.zeros(64)
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        hist_l = cv2.calcHist([lab], [0], None, [32], [0, 100])
+        hist_a = cv2.calcHist([lab], [1], None, [16], [0, 255])
+        hist_b = cv2.calcHist([lab], [2], None, [16], [0, 255])
+        hist_l = cv2.normalize(hist_l, hist_l).flatten()
+        hist_a = cv2.normalize(hist_a, hist_a).flatten()
+        hist_b = cv2.normalize(hist_b, hist_b).flatten()
+        return np.concatenate([hist_l, hist_a, hist_b])
+
+    def _hog(self, img):
+        if img.size == 0:
+            return np.zeros(64)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if gray.shape[0] < 8 or gray.shape[1] < 8:
+            gray = cv2.resize(gray, (16, 16))
+        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        magnitude = np.sqrt(gx**2 + gy**2)
+        direction = np.arctan2(gy, gx) * 180 / np.pi
+        direction = ((direction + 180) % 360).astype(np.uint8)
+        h, w = magnitude.shape
+        cell = 8
+        n_x, n_y = w // cell, h // cell
+        hist = np.zeros(64)
+        for i in range(0, min(n_y * cell, h), cell):
+            for j in range(0, min(n_x * cell, w), cell):
+                cell_mag = magnitude[i : i + cell, j : j + cell]
+                cell_dir = direction[i : i + cell, j : j + cell]
+                for mag, d in zip(cell_mag.flatten(), cell_dir.flatten()):
+                    bin_idx = int(d / 360 * 64) % 64
+                    hist[bin_idx] += mag
+        hist = hist / (np.linalg.norm(hist) + 1e-8)
+        return hist
+
+    def _texture(self, img):
+        if img.size == 0:
+            return np.zeros(32)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if gray.shape[0] < 8 or gray.shape[1] < 8:
+            gray = cv2.resize(gray, (16, 16))
+        kernel = np.ones((3, 3), np.float32) / 9
+        local_mean = cv2.filter2D(gray.astype(np.float32), -1, kernel)
+        local_var = cv2.filter2D((gray.astype(np.float32) - local_mean) ** 2, -1, kernel)
+        hist = cv2.calcHist([local_var.astype(np.uint8)], [0], None, [32], [0, 256])
+        hist = cv2.normalize(hist, hist).flatten()
+        return hist
+
+    def _edge_density(self, img):
+        if img.size == 0:
+            return np.zeros(16)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        h, w = edges.shape
+        grid_h, grid_w = 4, 4
+        cell_h, cell_w = max(1, h // grid_h), max(1, w // grid_w)
+        densities = []
+        for i in range(grid_h):
+            for j in range(grid_w):
+                cell = edges[i * cell_h : (i + 1) * cell_h, j * cell_w : (j + 1) * cell_w]
+                density = np.sum(cell > 0) / (cell_h * cell_w)
+                densities.append(density)
+        densities = np.array(densities[:16])
+        if len(densities) < 16:
+            densities = np.pad(densities, (0, 16 - len(densities)), "constant")
+        return densities
+
+    @staticmethod
+    def similarity(f1, f2):
+        if f1 is None or f2 is None:
+            return 0.0
+        try:
+            dp = np.dot(f1, f2)
+            return float(dp / (np.linalg.norm(f1) * np.linalg.norm(f2) + 1e-8))
+        except Exception:
+            return 0.0
+
+
 class RetailCustomerTracker:
     """
     Production-ready retail customer tracking system.
@@ -44,6 +166,11 @@ class RetailCustomerTracker:
         # Track buffer for re-identification
         self.lost_tracks = {}  # {track_id: {data, timestamp}}
         self.max_lost_time = 5.0  # 5 seconds max
+        # ReID enhancements
+        self.reid = LightweightReID()
+        self.reid_high_thresh = 0.50  # Stage 1: high confidence
+        self.reid_low_thresh = 0.30   # Stage 2: low confidence
+        self.feature_gallery_size = 10
         
         # Logs
         self.events = []
@@ -105,31 +232,39 @@ class RetailCustomerTracker:
     def _update_track(self, track_id, box, conf, frame):
         """Update or create tracking information for a track."""
         
+        # Extract appearance features
+        features = self.reid.extract_features(frame, box)
+
+        # Try ReID with lost tracks before creating new
         if track_id not in self.customers:
-            # New customer
-            customer_id = f"CUST_{self.next_customer_id:04d}"
-            self.next_customer_id += 1
-            
-            self.customers[track_id] = {
-                'customer_id': customer_id,
-                'track_id': track_id,
-                'entry_time': datetime.now(),
-                'entry_box': box,
-                'confidence_scores': deque(maxlen=30),
-                'suspicious_count': 0,
-                'items_detected': set(),
-                'last_detection_time': datetime.now()
-            }
-            
-            self.events.append({
-                'event': 'ENTRY',
-                'customer_id': customer_id,
-                'track_id': track_id,
-                'timestamp': datetime.now().isoformat(),
-                'location': {'x': float(box[0]), 'y': float(box[1])}
-            })
-            
-            print(f"✅ Entry | {customer_id} (Track {track_id})")
+            matched = self._try_reid(track_id, box, features)
+            if matched:
+                customer = matched
+                self.customers[track_id] = customer
+                print(f"🔄 ReID | {customer['customer_id']} (New Track {track_id})")
+            else:
+                # New customer
+                customer_id = f"CUST_{self.next_customer_id:04d}"
+                self.next_customer_id += 1
+                self.customers[track_id] = {
+                    'customer_id': customer_id,
+                    'track_id': track_id,
+                    'entry_time': datetime.now(),
+                    'entry_box': box,
+                    'confidence_scores': deque(maxlen=30),
+                    'suspicious_count': 0,
+                    'items_detected': set(),
+                    'last_detection_time': datetime.now(),
+                    'feature_gallery': deque(maxlen=self.feature_gallery_size),
+                }
+                self.events.append({
+                    'event': 'ENTRY',
+                    'customer_id': customer_id,
+                    'track_id': track_id,
+                    'timestamp': datetime.now().isoformat(),
+                    'location': {'x': float(box[0]), 'y': float(box[1])}
+                })
+                print(f"✅ Entry | {customer_id} (Track {track_id})")
         
         # Update existing customer
         customer = self.customers[track_id]
@@ -137,13 +272,16 @@ class RetailCustomerTracker:
         customer['confidence_scores'].append(conf)
         customer['last_detection_time'] = datetime.now()
         
+        # Update feature gallery
+        if features is not None:
+            if 'feature_gallery' not in customer:
+                customer['feature_gallery'] = deque(maxlen=self.feature_gallery_size)
+            customer['feature_gallery'].append(features)
+        
         # Store trajectory
         center_x = (box[0] + box[2]) / 2
         center_y = (box[1] + box[3]) / 2
         self.track_history[track_id].append((center_x, center_y))
-        
-        # Detect suspicious behavior (optional: check if reaching for items)
-        # This is where you'd add gesture recognition, item detection, etc.
         
         # Clean up lost track entry if customer re-appears
         if track_id in self.lost_tracks:
@@ -165,9 +303,15 @@ class RetailCustomerTracker:
             customer = self.customers[track_id]
             
             if track_id not in self.lost_tracks:
+                # Compute average feature for gallery
+                avg_feat = None
+                if customer.get('feature_gallery'):
+                    avg_feat = np.mean(customer['feature_gallery'], axis=0)
                 self.lost_tracks[track_id] = {
                     'lost_time': current_time,
-                    'data': customer.copy()
+                    'data': customer.copy(),
+                    'last_box': customer.get('last_box', customer.get('entry_box')),
+                    'features': avg_feat
                 }
                 print(f"⏸️  Occlusion | {customer['customer_id']} (Track {track_id})")
         
@@ -193,6 +337,69 @@ class RetailCustomerTracker:
             'suspicious_count': int(self.customers.get(track_id, {}).get('suspicious_count', 0))
         })
         print(f"🚪 Exit | {customer_id} (Duration: {duration:.1f}s)")
+
+    def _iou(self, box1, box2):
+        if box1 is None or box2 is None:
+            return 0.0
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union = area1 + area2 - inter + 1e-8
+        return inter / union
+
+    def _try_reid(self, track_id, box, features):
+        """Try to re-identify a lost track using appearance + IoU."""
+        if features is None:
+            return None
+        best = None
+        now = datetime.now()
+        for lost_id, data in list(self.lost_tracks.items()):
+            # Time gating
+            lost_time = data['lost_time']
+            if (now - lost_time).total_seconds() > self.max_lost_time:
+                continue
+            # IoU gating
+            iou = self._iou(box, data.get('last_box'))
+            if iou < 0.1:  # allow low IoU but still gate a bit
+                continue
+            # Similarity
+            sim = LightweightReID.similarity(features, data.get('features'))
+            # Two-stage matching
+            if sim >= self.reid_high_thresh or (sim >= self.reid_low_thresh and iou >= 0.2):
+                if best is None or sim > best['sim']:
+                    best = {
+                        'lost_id': lost_id,
+                        'sim': sim,
+                        'iou': iou,
+                        'data': data['data'],
+                        'features': data.get('features')
+                    }
+        if best is None:
+            return None
+        # Reuse customer data with new track_id
+        customer = best['data']
+        customer['track_id'] = track_id
+        customer['last_box'] = box
+        customer['last_detection_time'] = now
+        # merge galleries
+        gallery = deque(maxlen=self.feature_gallery_size)
+        if customer.get('feature_gallery'):
+            for f in customer['feature_gallery']:
+                gallery.append(f)
+        if best.get('features') is not None:
+            gallery.append(best['features'])
+        if features is not None:
+            gallery.append(features)
+        customer['feature_gallery'] = gallery
+        # clean old entries
+        if best['lost_id'] in self.customers:
+            del self.customers[best['lost_id']]
+        del self.lost_tracks[best['lost_id']]
+        return customer
     
     def _draw_trajectories(self, frame):
         """Draw movement trajectories on frame."""

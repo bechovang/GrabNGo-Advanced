@@ -4,31 +4,14 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-pip-wheel-metadata/
-share/python-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+dist/
+build/
 
 # Virtual Environment
 venv/
 env/
 ENV/
-env.bak/
-venv.bak/
 
 # IDE
 .vscode/
@@ -36,59 +19,24 @@ venv.bak/
 *.swp
 *.swo
 *~
-.DS_Store
 
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# PyTorch
-*.pth
-*.pt
-*.ckpt
-
-# Model weights and checkpoints
-checkpoints/
-weights/
-models/
-*.h5
-*.hdf5
-
-# Data files
-*.mp4
-*.avi
-*.mov
-*.mkv
-*.jpg
-*.jpeg
-*.png
-*.gif
-*.bmp
-data/
-datasets/
-videos/
-images/
-
-# Logs
-*.json
+# Logs and data
 *.log
-logs/
-tensorboard_logs/
+*.json
+!package.json
+!package-lock.json
 customer_logs.json
 tracking_events.json
-*_logs.json
 
-# Environment variables
-.env
-.env.local
-
-# OS
-Thumbs.db
-.DS_Store
-
-# Project specific
-yolov8_tracking/
-strong_sort/
+# Models (large files - add to git LFS if needed)
 *.pt
+*.onnx
 *.pth
 
-venv/
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak

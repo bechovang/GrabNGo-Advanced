@@ -12,7 +12,29 @@ from collections import defaultdict, deque
 from datetime import datetime
 import numpy as np
 from enum import Enum
-from holding_detector import HoldingDetector
+# Import holding_detector with fallback for different execution contexts
+# Make it optional since holding detection is currently disabled
+HoldingDetector = None
+try:
+    try:
+        from .holding_detector import HoldingDetector
+    except (ImportError, ValueError):
+        # Fallback for when running as script or from different context
+        import os
+        import sys
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.dirname(current_dir)
+        if parent_dir not in sys.path:
+            sys.path.insert(0, parent_dir)
+        from src.holding_detector import HoldingDetector
+except ImportError:
+    # MediaPipe might not be available - holding detection will be disabled
+    print("⚠️  Warning: HoldingDetector not available (mediapipe may be missing). Holding detection disabled.")
+    class HoldingDetector:
+        def __init__(self):
+            pass
+        def reset_customer(self, customer_id):
+            pass
 
 
 class TrackState(Enum):
@@ -151,7 +173,7 @@ class RetailCustomerTracker:
     
     def __init__(self, 
                  detection_model='yolo11n-pose.pt',  # Changed to pose model
-                 tracker_config='botsort_reid.yaml',
+                 tracker_config='config/botsort_reid.yaml',
                  device='cuda' if torch.cuda.is_available() else 'cpu'):
         """
         Initialize tracker with ReID configuration.
@@ -191,8 +213,11 @@ class RetailCustomerTracker:
         self.min_confidence_avg = 0.5   # Average confidence >= 0.5
         self.min_feature_quality = 0.3  # At least 30% valid features
         
-        # Holding Detection System
-        self.holding_detector = HoldingDetector()
+        # Holding Detection System (optional - currently disabled)
+        try:
+            self.holding_detector = HoldingDetector() if HoldingDetector else None
+        except Exception:
+            self.holding_detector = None
         
         # Logs
         self.events = []
@@ -657,7 +682,8 @@ class RetailCustomerTracker:
     def _finalize_customer(self, track_id, customer_id, duration):
         """Finalize customer exit."""
         # Clean up holding detector state
-        self.holding_detector.reset_customer(customer_id)
+        if self.holding_detector:
+            self.holding_detector.reset_customer(customer_id)
         
         self.events.append({
             'event': 'EXIT',
@@ -1262,10 +1288,9 @@ def main():
     print("="*70 + "\n")
     
     # Initialize tracker
-    # Make sure botsort_reid.yaml is in ultralytics/cfg/trackers/
     tracker = RetailCustomerTracker(
         detection_model='yolo11n-pose.pt',  # Use pose model for keypoints
-        tracker_config='botsort_reid.yaml'
+        tracker_config='config/botsort_reid.yaml'
     )
     
     # Open webcam

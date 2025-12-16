@@ -219,6 +219,21 @@ class RetailCustomerTracker:
         except Exception:
             self.holding_detector = None
         
+        # QR Zone Configuration (right side, full height)
+        # Zone will be set dynamically based on frame size, but default to percentage
+        self.qr_zone_percent = {
+            'x1_percent': 0.7,    # 70% from left (right side)
+            'y1_percent': 0.0,    # 0% from top (top edge - full height)
+            'x2_percent': 1.0,    # 100% from left (right edge)
+            'y2_percent': 1.0     # 100% from top (bottom edge - full height)
+        }
+        self.qr_zone_pixels = None  # Will be calculated from frame size
+        self.zone_active_pending = None  # Which PENDING is currently in zone
+        self.zone_overlap_threshold = 0.5  # 50% of person must be in zone
+        
+        # QR Confirmation System
+        self.pending_confirmations = {}  # {customer_id: pending_id} - for auto-matching
+        
         # Logs
         self.events = []
         
@@ -226,6 +241,7 @@ class RetailCustomerTracker:
         print(f"   Model: {detection_model}")
         print(f"   Config: {tracker_config}")
         print(f"   Holding detection: Hand Region Analysis (Edge + YOLO + Texture)")
+        print(f"   QR Zone: Right side, full height (70-100% width, 0-100% height)")
     
     def process_frame(self, frame, conf=0.6, iou=0.5, return_annotated=True):
         """
@@ -283,10 +299,17 @@ class RetailCustomerTracker:
         # Prepare output
         annotated_frame = result.plot(labels=False) if return_annotated else None
         
+        # Update QR zone based on frame size (if not set yet or frame size changed)
+        if return_annotated and annotated_frame is not None:
+            self._update_qr_zone(annotated_frame.shape)
+            # Check QR zone status
+            self._check_qr_zone()
+        
         # Draw trajectory and custom overlays
         if return_annotated:
             annotated_frame = self._draw_trajectories(annotated_frame)
             annotated_frame = self._draw_pending_tracks(annotated_frame, result)
+            annotated_frame = self._draw_qr_zone(annotated_frame)
             # Holding status display - TEMPORARILY DISABLED
             # annotated_frame = self._draw_holding_status(annotated_frame)
         
@@ -628,6 +651,210 @@ class RetailCustomerTracker:
             pending = self.pending_tracks[track_id]
             print(f"⏱️  Timeout | {pending['pending_id']} removed (no confirmation)")
             del self.pending_tracks[track_id]
+    
+    def _update_qr_zone(self, frame_shape):
+        """Update QR zone pixel coordinates based on frame size."""
+        if frame_shape is None or len(frame_shape) < 2:
+            return
+        
+        height, width = frame_shape[0], frame_shape[1]
+        
+        # Calculate pixel coordinates from percentages (bottom-left corner)
+        self.qr_zone_pixels = {
+            'x1': int(width * self.qr_zone_percent['x1_percent']),
+            'y1': int(height * self.qr_zone_percent['y1_percent']),
+            'x2': int(width * self.qr_zone_percent['x2_percent']),
+            'y2': int(height * self.qr_zone_percent['y2_percent'])
+        }
+    
+    def _is_in_qr_zone(self, box):
+        """Check if bounding box overlaps with QR zone."""
+        if self.qr_zone_pixels is None or box is None:
+            return False
+        
+        x1, y1, x2, y2 = map(int, box)
+        zone = self.qr_zone_pixels
+        
+        # Calculate overlap area
+        overlap_x1 = max(x1, zone['x1'])
+        overlap_y1 = max(y1, zone['y1'])
+        overlap_x2 = min(x2, zone['x2'])
+        overlap_y2 = min(y2, zone['y2'])
+        
+        if overlap_x2 > overlap_x1 and overlap_y2 > overlap_y1:
+            overlap_area = (overlap_x2 - overlap_x1) * (overlap_y2 - overlap_y1)
+            box_area = (x2 - x1) * (y2 - y1)
+            if box_area > 0:
+                overlap_ratio = overlap_area / box_area
+                return overlap_ratio >= self.zone_overlap_threshold
+        
+        return False
+    
+    def _check_qr_zone(self):
+        """Check which PENDING track is currently in QR zone."""
+        pending_in_zone = None
+        pending_count = 0
+        
+        for track_id, pending in self.pending_tracks.items():
+            box = pending.get('box')
+            if box is None:
+                continue
+            
+            if self._is_in_qr_zone(box):
+                pending_count += 1
+                if pending_in_zone is None:
+                    pending_in_zone = pending.get('pending_id')
+        
+        # Update zone status
+        if pending_count == 1:
+            self.zone_active_pending = pending_in_zone
+        else:
+            self.zone_active_pending = None
+        
+        return self.zone_active_pending is not None, self.zone_active_pending, pending_count
+    
+    def _draw_qr_zone(self, frame):
+        """Draw QR zone overlay on frame."""
+        if self.qr_zone_pixels is None:
+            return frame
+        
+        zone = self.qr_zone_pixels
+        x1, y1 = zone['x1'], zone['y1']
+        x2, y2 = zone['x2'], zone['y2']
+        
+        # Check zone status
+        zone_active, pending_id, pending_count = self._check_qr_zone()
+        
+        # Draw rectangle
+        if zone_active and pending_count == 1:
+            color = (0, 255, 0)  # Green = active, ready to scan
+            thickness = 3
+        else:
+            color = (0, 0, 255)  # Red = inactive, waiting
+            thickness = 2
+        
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+        
+        # Draw label
+        if zone_active and pending_count == 1:
+            label = f"QR ZONE ✅ ACTIVE - {pending_id}"
+        elif pending_count > 1:
+            label = f"QR ZONE ⚠️ MULTIPLE ({pending_count})"
+        else:
+            label = "QR ZONE ⏸️ WAITING"
+        
+        # Draw label with background
+        label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+        label_y = y1 - 10 if y1 > 30 else y2 + 25
+        cv2.rectangle(frame, (x1, label_y - label_size[1] - 5), 
+                     (x1 + label_size[0] + 10, label_y + 5), (0, 0, 0), -1)
+        cv2.putText(frame, label, (x1 + 5, label_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        
+        return frame
+    
+    def confirm_pending_with_customer_id(self, customer_id, pending_id=None):
+        """
+        Confirm a PENDING track with customer_id from QR scan.
+        
+        Args:
+            customer_id: Customer ID from QR code (e.g., "CUST_001")
+            pending_id: Optional PENDING ID. If None, uses zone_active_pending.
+        
+        Returns:
+            tuple: (success: bool, message: str)
+        """
+        print(f"\n🔔 QR Confirmation Request:")
+        print(f"   Customer ID: {customer_id}")
+        print(f"   Pending ID (provided): {pending_id}")
+        print(f"   Zone active pending: {self.zone_active_pending}")
+        print(f"   Current pending tracks: {list(self.pending_tracks.keys())}")
+        
+        # Re-check zone status to get latest state (avoid race condition)
+        zone_active, zone_pending_id, pending_count = self._check_qr_zone()
+        print(f"   Zone status (re-checked): active={zone_active}, pending_id={zone_pending_id}, count={pending_count}")
+        
+        # If pending_id not provided, use zone_active_pending (from latest check)
+        if pending_id is None:
+            pending_id = zone_pending_id if zone_active and pending_count == 1 else self.zone_active_pending
+            print(f"   Using pending_id: {pending_id}")
+        
+        if pending_id is None:
+            # Debug: List all pending tracks and their positions
+            print(f"   ❌ No PENDING track in QR zone")
+            print(f"   Available pending tracks:")
+            for tid, pending in self.pending_tracks.items():
+                box = pending.get('box')
+                in_zone = self._is_in_qr_zone(box) if box else False
+                print(f"      - Track {tid}: {pending.get('pending_id')}, in_zone={in_zone}, box={box}")
+            return False, "No PENDING track in QR zone"
+        
+        # Find track_id from pending_id
+        track_id = None
+        for tid, pending in self.pending_tracks.items():
+            if pending.get('pending_id') == pending_id:
+                track_id = tid
+                print(f"   ✅ Found track_id: {track_id} for pending_id: {pending_id}")
+                break
+        
+        if track_id is None:
+            print(f"   ❌ PENDING track {pending_id} not found in pending_tracks")
+            print(f"   Available pending_ids: {[p.get('pending_id') for p in self.pending_tracks.values()]}")
+            return False, f"PENDING track {pending_id} not found"
+        
+        # Confirm the track
+        pending = self.pending_tracks[track_id]
+        
+        # Validate before confirming
+        all_current_boxes = []
+        for other_track_id, other_customer in self.customers.items():
+            if other_track_id != track_id and other_customer.get('last_box') is not None:
+                all_current_boxes.append(other_customer['last_box'])
+        for other_track_id, other_pending in self.pending_tracks.items():
+            if other_track_id != track_id and other_pending.get('box') is not None:
+                all_current_boxes.append(other_pending['box'])
+        
+        print(f"   Validating pending track...")
+        is_valid, validation_score, issues = self._validate_pending_track(pending, all_current_boxes)
+        print(f"   Validation result: valid={is_valid}, score={validation_score:.0%}")
+        if issues:
+            print(f"   Issues: {issues}")
+        
+        if not is_valid:
+            return False, f"Validation failed (score: {validation_score:.0%})"
+        
+        # Move from pending to confirmed
+        customer_data = {
+            'customer_id': customer_id,
+            'first_seen': pending['first_seen'],
+            'last_detection_time': datetime.now(),
+            'feature_gallery': pending['feature_gallery'],
+            'confidence_scores': pending['confidence_scores'],
+            'last_box': pending.get('box'),
+            'keypoints': pending.get('keypoints'),
+            'frame_height': pending.get('frame_height')
+        }
+        
+        self.customers[track_id] = customer_data
+        del self.pending_tracks[track_id]
+        
+        # Reset zone
+        self.zone_active_pending = None
+        
+        # Log event
+        self.events.append({
+            'type': 'confirmed',
+            'customer_id': customer_id,
+            'track_id': int(track_id),
+            'pending_id': pending_id,
+            'timestamp': datetime.now().isoformat(),
+            'validation_score': validation_score
+        })
+        
+        print(f"✅ Confirmed | {customer_id} (Track {track_id}) from QR scan")
+        print(f"   Validation: {validation_score:.0%} | Samples: {len(customer_data['feature_gallery'])}")
+        
+        return True, f"Confirmed {customer_id}"
     
     def _handle_occlusions(self, current_tracks):
         """
@@ -1285,6 +1512,7 @@ def main():
     print("🎯 SMART RETAIL TRACKING SYSTEM")
     print("   Tracker: BoT-SORT with native ReID")
     print("   Features: Appearance matching, Occlusion handling, Motion prediction")
+    print("   QR Confirmation: Bottom-left zone scanning")
     print("="*70 + "\n")
     
     # Initialize tracker
@@ -1292,6 +1520,25 @@ def main():
         detection_model='yolo11n-pose.pt',  # Use pose model for keypoints
         tracker_config='config/botsort_reid.yaml'
     )
+    
+    # Start web server in background thread
+    try:
+        import sys
+        import os
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from web_server import run_server
+        import threading
+        
+        server_thread = threading.Thread(
+            target=run_server,
+            args=(tracker, '0.0.0.0', 8080, False),
+            daemon=True
+        )
+        server_thread.start()
+        print("✅ Web server started in background thread")
+    except Exception as e:
+        print(f"⚠️  Warning: Could not start web server: {e}")
+        print("   QR confirmation will not be available")
     
     # Open webcam
     cap = cv2.VideoCapture(0)
@@ -1312,10 +1559,14 @@ def main():
     print(f"   • Min feature quality: {tracker.min_feature_quality:.0%}")
     print("\n⌨️  Keys:")
     print("      q = quit")
-    print("      c = confirm selected pending track (if validated)")
+    print("      c = confirm selected pending track (if validated) - DEPRECATED, use QR scanner")
     print("      1-9 = select pending track by number")
     print("      s = save logs")
-    print("      i = info\n")
+    print("      i = info")
+    print("\n📱 QR Confirmation:")
+    print("      Open http://localhost:8080 on mobile phone")
+    print("      Customer stands in bottom-left QR zone")
+    print("      Scan customer's QR code when zone turns green\n")
     
     try:
         while True:

@@ -245,3 +245,4 @@ combined_score = 0.6 * proximity_score + 0.4 * hand_score
 - Hand position detection requires YOLO pose keypoints
 - System works best with clear view of shelf and customers
 
+

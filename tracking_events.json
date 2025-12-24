@@ -1,1 +1,72 @@
-[]
+[
+  {
+    "type": "unmatched_weight_event",
+    "weight_change_g": -58,
+    "timestamp": "2025-12-24T16:33:36.089460",
+    "shelf_id": "shelf-1",
+    "reason": "no_customer_in_zone"
+  },
+  {
+    "type": "unmatched_weight_event",
+    "weight_change_g": -334,
+    "timestamp": "2025-12-24T16:33:43.005419",
+    "shelf_id": "shelf-1",
+    "reason": "no_customer_in_zone"
+  },
+  {
+    "type": "unmatched_weight_event",
+    "weight_change_g": -383,
+    "timestamp": "2025-12-24T16:33:59.398870",
+    "shelf_id": "shelf-1",
+    "reason": "no_customer_in_zone"
+  },
+  {
+    "type": "unmatched_weight_event",
+    "weight_change_g": -377,
+    "timestamp": "2025-12-24T16:35:11.628141",
+    "shelf_id": "shelf-1",
+    "reason": "no_customer_in_zone"
+  },
+  {
+    "type": "unmatched_weight_event",
+    "weight_change_g": -110,
+    "timestamp": "2025-12-24T16:35:20.973109",
+    "shelf_id": "shelf-1",
+    "reason": "no_customer_in_zone"
+  },
+  {
+    "type": "unmatched_weight_event",
+    "weight_change_g": -245,
+    "timestamp": "2025-12-24T16:35:23.266537",
+    "shelf_id": "shelf-1",
+    "reason": "no_customer_in_zone"
+  },
+  {
+    "type": "unmatched_weight_event",
+    "weight_change_g": -2734,
+    "timestamp": "2025-12-24T16:35:29.838870",
+    "shelf_id": "shelf-1",
+    "reason": "no_customer_in_zone"
+  },
+  {
+    "type": "unmatched_weight_event",
+    "weight_change_g": -376,
+    "timestamp": "2025-12-24T16:35:37.844893",
+    "shelf_id": "shelf-1",
+    "reason": "no_customer_in_zone"
+  },
+  {
+    "type": "unmatched_weight_event",
+    "weight_change_g": -365,
+    "timestamp": "2025-12-24T16:35:51.841276",
+    "shelf_id": "shelf-1",
+    "reason": "no_customer_in_zone"
+  },
+  {
+    "type": "unmatched_weight_event",
+    "weight_change_g": -366,
+    "timestamp": "2025-12-24T16:35:58.248617",
+    "shelf_id": "shelf-1",
+    "reason": "no_customer_in_zone"
+  }
+]

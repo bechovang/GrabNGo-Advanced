@@ -234,6 +234,26 @@ class RetailCustomerTracker:
         # QR Confirmation System
         self.pending_confirmations = {}  # {customer_id: pending_id} - for auto-matching
         
+        # MQTT Configuration for Weight-Based Pickup Detection
+        self.mqtt_broker = "test.mosquitto.org"
+        self.mqtt_topic_weight = "my-shop/shelf-1/events"
+        self.mqtt_client = None
+        self.mqtt_connected = False
+        
+        # Shelf Zone Configuration (where items are placed)
+        # Default: Left side, middle-bottom area (adjust based on camera view)
+        self.shelf_zone_percent = {
+            'x1_percent': 0.0,    # Left edge
+            'y1_percent': 0.3,    # 30% from top
+            'x2_percent': 0.5,    # 50% from left (middle of frame)
+            'y2_percent': 0.9     # 90% from top (near bottom)
+        }
+        self.shelf_zone_pixels = None  # Will be calculated from frame size
+        
+        # Weight Event Handling
+        self.recent_weight_events = deque(maxlen=10)  # Last 10 events
+        self.weight_event_timeout = 3.0  # Match events within 3 seconds
+        
         # Logs
         self.events = []
         
@@ -242,6 +262,7 @@ class RetailCustomerTracker:
         print(f"   Config: {tracker_config}")
         print(f"   Holding detection: Hand Region Analysis (Edge + YOLO + Texture)")
         print(f"   QR Zone: Right side, full height (70-100% width, 0-100% height)")
+        print(f"   Shelf Zone: Left-middle area (0-50% width, 30-90% height)")
     
     def process_frame(self, frame, conf=0.6, iou=0.5, return_annotated=True):
         """
@@ -299,17 +320,22 @@ class RetailCustomerTracker:
         # Prepare output
         annotated_frame = result.plot(labels=False) if return_annotated else None
         
-        # Update QR zone based on frame size (if not set yet or frame size changed)
+        # Update QR zone and Shelf zone based on frame size
         if return_annotated and annotated_frame is not None:
             self._update_qr_zone(annotated_frame.shape)
+            self._update_shelf_zone(annotated_frame.shape)
             # Check QR zone status
             self._check_qr_zone()
+        
+        # MQTT messages are handled automatically by loop_start() background thread
+        # No need to check here - callbacks will be called automatically
         
         # Draw trajectory and custom overlays
         if return_annotated:
             annotated_frame = self._draw_trajectories(annotated_frame)
             annotated_frame = self._draw_pending_tracks(annotated_frame, result)
             annotated_frame = self._draw_qr_zone(annotated_frame)
+            annotated_frame = self._draw_shelf_zone(annotated_frame)
             # Holding status display - TEMPORARILY DISABLED
             # annotated_frame = self._draw_holding_status(annotated_frame)
         
@@ -608,6 +634,10 @@ class RetailCustomerTracker:
             'feature_gallery': pending['feature_gallery'],
             'holding_status': {},
             'was_holding': False,
+            # Shopping cart for weight-based pickup detection
+            'shopping_cart': [],
+            'pickup_count': 0,
+            'last_pickup_time': None,
         }
         
         self.events.append({
@@ -753,6 +783,502 @@ class RetailCustomerTracker:
         
         return frame
     
+    def _update_shelf_zone(self, frame_shape):
+        """Update shelf zone pixel coordinates from frame size."""
+        if len(frame_shape) < 2:
+            return
+        h, w = frame_shape[:2]
+        self.shelf_zone_pixels = {
+            'x1': int(w * self.shelf_zone_percent['x1_percent']),
+            'y1': int(h * self.shelf_zone_percent['y1_percent']),
+            'x2': int(w * self.shelf_zone_percent['x2_percent']),
+            'y2': int(h * self.shelf_zone_percent['y2_percent'])
+        }
+    
+    def _is_in_shelf_zone(self, box):
+        """Check if person's bounding box overlaps with shelf zone."""
+        if self.shelf_zone_pixels is None or box is None:
+            return False
+        
+        x1, y1, x2, y2 = box
+        sx1 = self.shelf_zone_pixels['x1']
+        sy1 = self.shelf_zone_pixels['y1']
+        sx2 = self.shelf_zone_pixels['x2']
+        sy2 = self.shelf_zone_pixels['y2']
+        
+        # Calculate overlap
+        overlap_x1 = max(x1, sx1)
+        overlap_y1 = max(y1, sy1)
+        overlap_x2 = min(x2, sx2)
+        overlap_y2 = min(y2, sy2)
+        
+        if overlap_x2 <= overlap_x1 or overlap_y2 <= overlap_y1:
+            return False
+        
+        overlap_area = (overlap_x2 - overlap_x1) * (overlap_y2 - overlap_y1)
+        person_area = (x2 - x1) * (y2 - y1)
+        overlap_ratio = overlap_area / person_area if person_area > 0 else 0
+        
+        return overlap_ratio >= 0.3  # At least 30% of person in zone
+    
+    def _draw_shelf_zone(self, frame):
+        """Draw shelf zone on frame for visualization."""
+        if self.shelf_zone_pixels is None:
+            return frame
+        
+        zone = self.shelf_zone_pixels
+        x1, y1 = zone['x1'], zone['y1']
+        x2, y2 = zone['x2'], zone['y2']
+        
+        # Draw rectangle (yellow/cyan for shelf zone)
+        color = (0, 255, 255)  # Cyan
+        thickness = 2
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+        
+        # Draw label
+        label = "SHELF ZONE"
+        label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+        label_y = y1 - 10 if y1 > 30 else y2 + 25
+        cv2.rectangle(frame, (x1, label_y - label_size[1] - 5), 
+                     (x1 + label_size[0] + 10, label_y + 5), (0, 0, 0), -1)
+        cv2.putText(frame, label, (x1 + 5, label_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        
+        return frame
+    
+    def _init_mqtt(self):
+        """Initialize MQTT client and subscribe to weight events."""
+        try:
+            import paho.mqtt.client as mqtt
+            import uuid
+            import socket
+            import time
+            
+            # Check if paho-mqtt is installed
+            try:
+                import paho.mqtt.client as mqtt
+            except ImportError:
+                print("⚠️  paho-mqtt not installed. Install with: pip install paho-mqtt")
+                print("   Weight-based pickup detection will be disabled")
+                self.mqtt_connected = False
+                return
+            
+            # Test network connectivity first
+            print(f"🔍 Testing connection to {self.mqtt_broker}:1883...")
+            try:
+                test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                test_socket.settimeout(5)  # 5 second timeout
+                result = test_socket.connect_ex((self.mqtt_broker, 1883))
+                test_socket.close()
+                
+                if result != 0:
+                    print(f"⚠️  Cannot reach {self.mqtt_broker}:1883 (connection refused or timeout)")
+                    print(f"   This might be due to:")
+                    print(f"   - Firewall blocking port 1883")
+                    print(f"   - Network connectivity issues")
+                    print(f"   - Broker is down")
+                    print(f"   💡 Tip: Try using a local MQTT broker or check your network")
+                    self.mqtt_connected = False
+                    return
+            except Exception as e:
+                print(f"⚠️  Network test failed: {e}")
+                print(f"   Cannot verify connectivity to {self.mqtt_broker}")
+                # Continue anyway, let MQTT client handle the connection
+            
+            client_id = f"cv-system-{uuid.uuid4().hex[:8]}"
+            self.mqtt_client = mqtt.Client(client_id=client_id)
+            self.mqtt_client.on_connect = self._on_mqtt_connect
+            self.mqtt_client.on_message = self._on_mqtt_message
+            self.mqtt_client.on_disconnect = self._on_mqtt_disconnect
+            
+            # Set connection timeout and connect
+            print(f"   Attempting to connect to {self.mqtt_broker}:1883...")
+            try:
+                self.mqtt_client.connect_async(self.mqtt_broker, 1883, 60)
+                self.mqtt_client.loop_start()  # Start background thread
+                
+                print(f"✅ MQTT client initialized (connecting to {self.mqtt_broker}...)")
+                print(f"   Waiting for connection... (this may take a few seconds)")
+                
+                # Wait a bit for connection to establish
+                time.sleep(2)
+                
+                # Check connection status
+                if not self.mqtt_connected:
+                    print(f"⚠️  MQTT connection pending... (checking again in 3 seconds)")
+                    # Give it more time
+                    time.sleep(3)
+                    if not self.mqtt_connected:
+                        print(f"❌ MQTT connection timeout - broker may be unreachable")
+                        print(f"   Current status: mqtt_connected = {self.mqtt_connected}")
+                        print(f"   💡 Run 'python test_mqtt_connection.py' to diagnose the issue")
+            except Exception as conn_error:
+                print(f"❌ Failed to start MQTT connection: {conn_error}")
+                self.mqtt_connected = False
+                    
+        except ImportError:
+            print("⚠️  paho-mqtt not installed. Install with: pip install paho-mqtt")
+            print("   Weight-based pickup detection will be disabled")
+            self.mqtt_connected = False
+        except Exception as e:
+            print(f"⚠️  MQTT initialization failed: {e}")
+            print(f"   Error type: {type(e).__name__}")
+            import traceback
+            traceback.print_exc()
+            print("   Weight-based pickup detection will be disabled")
+            self.mqtt_connected = False
+    
+    def _on_mqtt_connect(self, client, userdata, flags, rc):
+        """Callback when MQTT client connects."""
+        if rc == 0:
+            self.mqtt_connected = True
+            # Subscribe to weight events topic
+            result = client.subscribe(self.mqtt_topic_weight)
+            if result[0] == 0:
+                print(f"✅ MQTT connected to {self.mqtt_broker}")
+                print(f"   Subscribed to: {self.mqtt_topic_weight}")
+            else:
+                print(f"⚠️  MQTT connected but subscription failed with code {result[0]}")
+        else:
+            error_messages = {
+                1: "Connection refused - incorrect protocol version",
+                2: "Connection refused - invalid client identifier",
+                3: "Connection refused - server unavailable",
+                4: "Connection refused - bad username or password",
+                5: "Connection refused - not authorised"
+            }
+            error_msg = error_messages.get(rc, f"Unknown error code {rc}")
+            print(f"❌ MQTT connection failed with code {rc}: {error_msg}")
+            print(f"   Broker: {self.mqtt_broker}:1883")
+            print(f"   Topic: {self.mqtt_topic_weight}")
+            self.mqtt_connected = False
+    
+    def _on_mqtt_disconnect(self, client, userdata, rc):
+        """Callback when MQTT client disconnects."""
+        self.mqtt_connected = False
+        if rc != 0:
+            print(f"⚠️  MQTT disconnected unexpectedly (code {rc})")
+        else:
+            print("ℹ️  MQTT disconnected")
+    
+    def _on_mqtt_message(self, client, userdata, msg):
+        """Handle incoming MQTT weight change events."""
+        try:
+            topic_str = msg.topic.decode('utf-8') if isinstance(msg.topic, bytes) else msg.topic
+            message_str = msg.payload.decode('utf-8') if isinstance(msg.payload, bytes) else str(msg.payload)
+            
+            if topic_str == self.mqtt_topic_weight:
+                # Parse: "CHANGE:-480"
+                if message_str.startswith("CHANGE:"):
+                    weight_change = int(message_str.split(":")[1])
+                    timestamp = datetime.now()
+                    
+                    # Store event
+                    self.recent_weight_events.append({
+                        'weight_change_g': weight_change,
+                        'timestamp': timestamp
+                    })
+                    
+                    print(f"\n⚖️  Weight Event: {weight_change:+d}g at {timestamp.strftime('%H:%M:%S.%f')[:-3]}")
+                    
+                    # Process weight event
+                    self._handle_weight_event(weight_change, timestamp)
+                else:
+                    print(f"⚠️  Unknown MQTT message format: {message_str}")
+        except Exception as e:
+            print(f"⚠️  Error processing MQTT message: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _find_customers_in_shelf_zone(self):
+        """Find all confirmed customers currently in shelf zone."""
+        candidates = []
+        
+        for track_id, customer in self.customers.items():
+            box = customer.get('last_box')
+            if box is None:
+                continue
+            
+            if self._is_in_shelf_zone(box):
+                candidates.append({
+                    'track_id': track_id,
+                    'customer_id': customer.get('customer_id'),
+                    'box': box,
+                    'keypoints': customer.get('keypoints'),
+                    'last_detection_time': customer.get('last_detection_time')
+                })
+        
+        return candidates
+    
+    def _is_hand_reaching_toward(self, wrist_x, wrist_y, person_box, shelf_center_x, shelf_center_y):
+        """Check if hand is extended toward shelf."""
+        person_center_x = (person_box[0] + person_box[2]) / 2
+        person_center_y = (person_box[1] + person_box[3]) / 2
+        
+        # Vector from person center to shelf center
+        to_shelf_x = shelf_center_x - person_center_x
+        to_shelf_y = shelf_center_y - person_center_y
+        
+        # Vector from person center to wrist
+        to_wrist_x = wrist_x - person_center_x
+        to_wrist_y = wrist_y - person_center_y
+        
+        # Calculate angle between vectors
+        dot = to_shelf_x * to_wrist_x + to_shelf_y * to_wrist_y
+        mag_shelf = np.sqrt(to_shelf_x**2 + to_shelf_y**2)
+        mag_wrist = np.sqrt(to_wrist_x**2 + to_wrist_y**2)
+        
+        if mag_shelf == 0 or mag_wrist == 0:
+            return False
+        
+        cos_angle = dot / (mag_shelf * mag_wrist)
+        angle = np.arccos(np.clip(cos_angle, -1.0, 1.0))
+        angle_deg = np.degrees(angle)
+        
+        # If angle < 45 degrees, hand is reaching toward shelf
+        return angle_deg < 45
+    
+    def _calculate_hand_reaching_score(self, keypoints, box, shelf_center_x, shelf_center_y):
+        """Calculate score based on hand position (reaching toward shelf)."""
+        if keypoints is None or len(keypoints.shape) < 2:
+            return 0.5  # Neutral if no keypoints
+        
+        # YOLO pose keypoints: 17 keypoints
+        # Index 9: left_wrist, Index 10: right_wrist
+        # Format: [x, y, confidence]
+        
+        score = 0.0
+        hand_count = 0
+        
+        # Check left wrist (index 9)
+        if len(keypoints) > 9 and keypoints[9][2] > 0.3:  # confidence > 0.3
+            wrist_x, wrist_y = keypoints[9][0], keypoints[9][1]
+            # Check if wrist is extended toward shelf
+            if self._is_hand_reaching_toward(wrist_x, wrist_y, box, shelf_center_x, shelf_center_y):
+                score += 0.5
+            hand_count += 1
+        
+        # Check right wrist (index 10)
+        if len(keypoints) > 10 and keypoints[10][2] > 0.3:
+            wrist_x, wrist_y = keypoints[10][0], keypoints[10][1]
+            if self._is_hand_reaching_toward(wrist_x, wrist_y, box, shelf_center_x, shelf_center_y):
+                score += 0.5
+            hand_count += 1
+        
+        if hand_count == 0:
+            return 0.5  # Neutral if no hands detected
+        
+        return score / hand_count if hand_count > 0 else 0.5
+    
+    def _rank_customers_by_pickup_likelihood(self, candidates, event_timestamp):
+        """Rank customers by likelihood of picking up item."""
+        if not candidates or self.shelf_zone_pixels is None:
+            return []
+        
+        ranked = []
+        shelf_center_x = (self.shelf_zone_pixels['x1'] + self.shelf_zone_pixels['x2']) / 2
+        shelf_center_y = (self.shelf_zone_pixels['y1'] + self.shelf_zone_pixels['y2']) / 2
+        
+        for candidate in candidates:
+            box = candidate['box']
+            keypoints = candidate.get('keypoints')
+            
+            # Calculate proximity score (0.0-1.0)
+            person_center_x = (box[0] + box[2]) / 2
+            person_center_y = (box[1] + box[3]) / 2
+            
+            distance = np.sqrt(
+                (person_center_x - shelf_center_x)**2 + 
+                (person_center_y - shelf_center_y)**2
+            )
+            max_distance = np.sqrt(
+                (self.shelf_zone_pixels['x2'] - self.shelf_zone_pixels['x1'])**2 +
+                (self.shelf_zone_pixels['y2'] - self.shelf_zone_pixels['y1'])**2
+            )
+            proximity_score = 1.0 - min(distance / max_distance, 1.0) if max_distance > 0 else 0.5
+            
+            # Calculate hand position score (0.0-1.0)
+            hand_score = self._calculate_hand_reaching_score(keypoints, box, shelf_center_x, shelf_center_y)
+            
+            # Combined score (weighted)
+            combined_score = 0.6 * proximity_score + 0.4 * hand_score
+            
+            ranked.append({
+                **candidate,
+                'proximity_score': proximity_score,
+                'hand_score': hand_score,
+                'combined_score': combined_score
+            })
+        
+        # Sort by combined score (highest first)
+        ranked.sort(key=lambda x: x['combined_score'], reverse=True)
+        
+        return ranked
+    
+    def _handle_weight_event(self, weight_change_g, timestamp):
+        """Process weight change event and match with customers."""
+        if weight_change_g >= 0:
+            # Weight increased (item returned) - optional, skip for now
+            return
+        
+        # Weight decreased (item picked up)
+        print(f"   🔍 Looking for customer who picked up item ({abs(weight_change_g)}g)...")
+        
+        # Find confirmed customers in shelf zone
+        candidates = self._find_customers_in_shelf_zone()
+        
+        if not candidates:
+            print(f"   ⚠️  No confirmed customers in shelf zone")
+            print(f"   📝 Logging as unmatched event")
+            self._log_unmatched_event(weight_change_g, timestamp, "no_customer_in_zone")
+            return
+        
+        # Rank candidates by proximity + hand position
+        ranked = self._rank_customers_by_pickup_likelihood(candidates, timestamp)
+        
+        if not ranked:
+            print(f"   ⚠️  No suitable candidate found")
+            self._log_unmatched_event(weight_change_g, timestamp, "no_suitable_candidate")
+            return
+        
+        # Ping closest/most likely customer
+        best_customer = ranked[0]
+        print(f"   ✅ Found {len(ranked)} candidate(s), best: {best_customer['customer_id']} (score: {best_customer['combined_score']:.0%})")
+        self._ping_customer_pickup(best_customer, weight_change_g, timestamp)
+    
+    def _log_unmatched_event(self, weight_change_g, timestamp, reason):
+        """Log weight event that couldn't be matched to a customer."""
+        event = {
+            'type': 'unmatched_weight_event',
+            'weight_change_g': weight_change_g,
+            'timestamp': timestamp.isoformat(),
+            'shelf_id': 'shelf-1',
+            'reason': reason
+        }
+        
+        self.events.append(event)
+        print(f"   📝 Unmatched event logged: {abs(weight_change_g)}g, reason: {reason}")
+    
+    def _ping_customer_pickup(self, customer_data, weight_change_g, timestamp):
+        """Ping customer: Update shopping cart with picked up item."""
+        track_id = customer_data['track_id']
+        customer_id = customer_data['customer_id']
+        
+        if track_id not in self.customers:
+            print(f"   ⚠️  Customer {customer_id} not found in customers dict")
+            return
+        
+        customer = self.customers[track_id]
+        
+        # Validate weight change (must be negative for pickup)
+        if weight_change_g >= 0:
+            print(f"   ⚠️  Invalid weight change: {weight_change_g}g (expected negative for pickup)")
+            return
+        
+        weight_grams = abs(weight_change_g)
+        
+        # Rate limiting: Check if last ping was too recent (within 2 seconds)
+        last_ping_time = customer.get('last_pickup_time')
+        if last_ping_time is not None:
+            # Handle both datetime object and ISO string
+            if isinstance(last_ping_time, str):
+                try:
+                    from dateutil import parser
+                    last_ping_time = parser.parse(last_ping_time)
+                except:
+                    # Fallback to datetime.fromisoformat
+                    try:
+                        last_ping_time = datetime.fromisoformat(last_ping_time.replace('Z', '+00:00'))
+                    except:
+                        print(f"   ⚠️  Could not parse last_pickup_time: {last_ping_time}")
+                        last_ping_time = None
+            
+            if last_ping_time is not None:
+                # Ensure timestamp is datetime object
+                if isinstance(timestamp, str):
+                    try:
+                        from dateutil import parser
+                        timestamp = parser.parse(timestamp)
+                    except:
+                        timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                
+                time_since_last = (timestamp - last_ping_time).total_seconds()
+                if time_since_last < 2.0:
+                    print(f"   ⏸️  Rate limited: Last ping was {time_since_last:.1f}s ago (min 2s)")
+                    return
+        
+        # Create item entry
+        item_entry = {
+            'weight_g': weight_grams,
+            'timestamp': timestamp.isoformat() if hasattr(timestamp, 'isoformat') else str(timestamp),
+            'shelf_id': 'shelf-1',
+            'confidence': customer_data.get('combined_score', 0.5)
+        }
+        
+        # Update shopping cart (add to items_detected)
+        if 'shopping_cart' not in customer:
+            customer['shopping_cart'] = []
+        
+        # Check for duplicate items (same weight within 3 seconds)
+        recent_items = [item for item in customer['shopping_cart'] 
+                       if abs(item.get('weight_g', 0) - weight_grams) < 10]  # Within 10g
+        if recent_items:
+            # Check if any recent item is within 3 seconds
+            for item in recent_items:
+                item_time_str = item.get('timestamp', '')
+                try:
+                    if isinstance(item_time_str, str):
+                        from dateutil import parser
+                        item_time = parser.parse(item_time_str)
+                    else:
+                        item_time = item_time_str
+                    
+                    if isinstance(timestamp, str):
+                        from dateutil import parser
+                        event_time = parser.parse(timestamp)
+                    else:
+                        event_time = timestamp
+                    
+                    time_diff = abs((event_time - item_time).total_seconds())
+                    if time_diff < 3.0:
+                        print(f"   ⚠️  Duplicate item detected: {weight_grams}g within {time_diff:.1f}s - skipping")
+                        return
+                except Exception as e:
+                    # If parsing fails, just add the item
+                    pass
+        
+        customer['shopping_cart'].append(item_entry)
+        
+        # Update counters
+        customer['pickup_count'] = customer.get('pickup_count', 0) + 1
+        customer['last_pickup_time'] = timestamp if hasattr(timestamp, 'isoformat') else datetime.now()
+        
+        if 'items_detected' not in customer:
+            customer['items_detected'] = set()
+        customer['items_detected'].add(f"item_{len(customer['shopping_cart'])}")
+        
+        # Log event
+        event = {
+            'type': 'item_picked_up',
+            'customer_id': customer_id,
+            'track_id': int(track_id),
+            'weight_change_g': weight_change_g,
+            'item_weight_g': weight_grams,
+            'timestamp': timestamp.isoformat() if hasattr(timestamp, 'isoformat') else str(timestamp),
+            'shelf_id': 'shelf-1',
+            'confidence': customer_data.get('combined_score', 0.5),
+            'proximity_score': customer_data.get('proximity_score', 0.0),
+            'hand_score': customer_data.get('hand_score', 0.0)
+        }
+        
+        self.events.append(event)
+        
+        print(f"   ✅ Pinged {customer_id} (Track {track_id})")
+        print(f"      Item: {weight_grams}g")
+        print(f"      Confidence: {customer_data.get('combined_score', 0.5):.0%}")
+        print(f"      Shopping cart: {len(customer['shopping_cart'])} items")
+        print(f"      Total weight: {sum(item.get('weight_g', 0) for item in customer['shopping_cart'])}g")
+    
     def confirm_pending_with_customer_id(self, customer_id, pending_id=None):
         """
         Confirm a PENDING track with customer_id from QR scan.
@@ -832,7 +1358,12 @@ class RetailCustomerTracker:
             'confidence_scores': pending['confidence_scores'],
             'last_box': pending.get('box'),
             'keypoints': pending.get('keypoints'),
-            'frame_height': pending.get('frame_height')
+            'frame_height': pending.get('frame_height'),
+            # Shopping cart for weight-based pickup detection
+            'shopping_cart': [],
+            'pickup_count': 0,
+            'last_pickup_time': None,
+            'items_detected': set()
         }
         
         self.customers[track_id] = customer_data
@@ -1516,37 +2047,56 @@ def main():
     print("="*70 + "\n")
     
     # Initialize tracker
+    print("🚀 Initializing tracker...")
+    print("   This may take a moment to load YOLO model...")
     tracker = RetailCustomerTracker(
         detection_model='yolo11n-pose.pt',  # Use pose model for keypoints
         tracker_config='config/botsort_reid.yaml'
     )
+    print("   Tracker initialized!")
     
-    # Start web server in background thread
+    # Initialize MQTT for weight-based pickup detection
+    print("🔌 Initializing MQTT...")
+    tracker._init_mqtt()
+    print("   MQTT initialization complete")
+    
+    # Open webcam with timeout
+    print("📹 Opening camera...")
+    import time
+    cap = None
     try:
-        import sys
-        import os
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        from web_server import run_server
-        import threading
+        cap = cv2.VideoCapture(0)
+        # Set timeout for camera initialization
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         
-        server_thread = threading.Thread(
-            target=run_server,
-            args=(tracker, '0.0.0.0', 8080, False),
-            daemon=True
-        )
-        server_thread.start()
-        print("✅ Web server started in background thread")
+        # Try to read a frame to verify camera works
+        print("   Testing camera...")
+        ret, test_frame = cap.read()
+        if not ret or test_frame is None:
+            print("❌ Camera opened but cannot read frames!")
+            cap.release()
+            cap = None
+        else:
+            print(f"✅ Camera ready! Frame size: {test_frame.shape}")
     except Exception as e:
-        print(f"⚠️  Warning: Could not start web server: {e}")
-        print("   QR confirmation will not be available")
+        print(f"❌ Camera error: {e}")
+        if cap:
+            cap.release()
+        cap = None
     
-    # Open webcam
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    
-    if not cap.isOpened():
-        print("❌ Cannot open camera!")
+    if cap is None or not cap.isOpened():
+        print("⚠️  Camera not available!")
+        print("   Dashboard will still work for MQTT events")
+        print("   Press Ctrl+C to exit, or wait for MQTT events...")
+        print("\n   Dashboard: http://localhost:8080/dashboard")
+        
+        # Keep running for dashboard/MQTT only
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n⚠️  Interrupted by user")
         return
     
     frame_count = 0
@@ -1559,14 +2109,12 @@ def main():
     print(f"   • Min feature quality: {tracker.min_feature_quality:.0%}")
     print("\n⌨️  Keys:")
     print("      q = quit")
-    print("      c = confirm selected pending track (if validated) - DEPRECATED, use QR scanner")
+    print("      c = confirm selected pending track (if validated)")
     print("      1-9 = select pending track by number")
     print("      s = save logs")
     print("      i = info")
-    print("\n📱 QR Confirmation:")
-    print("      Open http://localhost:8080 on mobile phone")
-    print("      Customer stands in bottom-left QR zone")
-    print("      Scan customer's QR code when zone turns green\n")
+    print("\n💡 Note: This is camera tracking only.")
+    print("   For dashboard, run: python run_dashboard.py\n")
     
     try:
         while True:

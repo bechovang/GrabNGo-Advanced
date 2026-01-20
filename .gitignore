@@ -40,3 +40,12 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.bak
+
+# BMAD docs - explicitly track these (do NOT ignore)
+!_bmad/
+!_bmad-output/
+!.bmad/
+!.agent/
+!.codex/
+!.cursor/
+!.opencode/

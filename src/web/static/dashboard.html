@@ -1,0 +1,926 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Retail Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --primary-color: #3498db;
+            --secondary-color: #2ecc71;
+            --warning-color: #f39c12;
+            --danger-color: #e74c3c;
+            --dark-color: #2c3e50;
+            --light-bg: #f8f9fa;
+            --border-color: #dee2e6;
+        }
+
+        body {
+            background-color: var(--light-bg);
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            overflow-x: hidden;
+        }
+
+        .header {
+            background-color: var(--dark-color);
+            color: white;
+            padding: 15px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .stats-card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+            padding: 20px;
+            margin-bottom: 20px;
+            transition: transform 0.3s ease;
+        }
+
+        .stats-card:hover {
+            transform: translateY(-5px);
+        }
+
+        .stats-number {
+            font-size: 2.5rem;
+            font-weight: bold;
+        }
+
+        .stats-label {
+            color: #6c757d;
+            font-size: 0.9rem;
+        }
+
+        .customer-card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+            padding: 15px;
+            margin-bottom: 15px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            border-left: 4px solid transparent;
+        }
+
+        .customer-card.active {
+            border-left-color: var(--primary-color);
+            transform: translateX(5px);
+        }
+
+        .customer-card:hover {
+            transform: translateX(5px);
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+        }
+
+        .customer-id {
+            font-weight: bold;
+            color: var(--primary-color);
+        }
+
+        .customer-status {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            margin-left: 10px;
+        }
+
+        .status-confirmed {
+            background-color: rgba(46, 204, 113, 0.2);
+            color: var(--secondary-color);
+        }
+
+        .status-pending {
+            background-color: rgba(243, 156, 18, 0.2);
+            color: var(--warning-color);
+        }
+
+        .shopping-cart {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+            padding: 15px;
+            height: 100%;
+        }
+
+        .cart-item {
+            padding: 10px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .cart-item:last-child {
+            border-bottom: none;
+        }
+
+
+        .time-display {
+            font-size: 1.2rem;
+            font-weight: bold;
+            color: var(--dark-color);
+        }
+
+        .system-status {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .status-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background-color: var(--secondary-color);
+        }
+
+        .status-indicator.disconnected {
+            background-color: var(--danger-color);
+        }
+
+        /* TV optimizations */
+        @media (min-width: 1400px) {
+            .stats-number {
+                font-size: 3rem;
+            }
+            
+            .customer-card {
+                padding: 20px;
+            }
+            
+            .cart-item {
+                padding: 15px;
+                font-size: 1.1rem;
+            }
+        }
+
+        /* Loading animation */
+        .loading-spinner {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100px;
+        }
+
+        .spinner-border {
+            width: 3rem;
+            height: 3rem;
+        }
+    </style>
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="container-fluid">
+            <div class="row align-items-center">
+                <div class="col-md-4">
+                    <h3 class="mb-0"><i class="bi bi-shop me-2"></i> Smart Retail Dashboard</h3>
+                </div>
+                <div class="col-md-4 text-center">
+                    <div class="time-display" id="current-time"></div>
+                </div>
+                <div class="col-md-4 text-end">
+                    <div class="system-status">
+                        <span class="status-indicator" id="connection-status"></span>
+                        <span id="connection-text">Connected</span>
+                    </div>
+                    <!-- Zone Controls -->
+                    <div class="system-status">
+                        <div class="me-3">
+                            <button class="btn btn-sm btn-outline-light" id="zone-settings-btn">
+                                <i class="bi bi-gear"></i> Zones
+                            </button>
+                        </div>
+                        <div>
+                            <span class="status-indicator" id="connection-status"></span>
+                            <span id="connection-text">Connected</span>
+                        </div>
+                    </div>
+
+<!-- Zone Settings Modal -->
+<div class="modal fade" id="zoneSettingsModal" tabindex="-1" aria-labelledby="zoneSettingsModalLabel" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="zoneSettingsModalLabel">
+          <i class="bi bi-bounding-box me-2"></i>Zone Settings
+        </h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <ul class="nav nav-tabs" id="zoneTabs" role="tablist">
+          <li class="nav-item" role="presentation">
+            <button class="nav-link active" id="qr-tab" data-bs-toggle="tab" data-bs-target="#qr-zone-tab" type="button" role="tab" aria-controls="qr-zone-tab" aria-selected="true">QR Zone</button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link" id="shelf-tab" data-bs-toggle="tab" data-bs-target="#shelf-zone-tab" type="button" role="tab" aria-controls="shelf-zone-tab" aria-selected="false">Shelf Zone</button>
+          </li>
+        </ul>
+        <div class="tab-content" id="zoneTabContent">
+          <!-- QR Zone Settings -->
+          <div class="tab-pane fade show active" id="qr-zone-tab" role="tabpanel" aria-labelledby="qr-tab">
+            <div class="mb-3">
+              <h6>QR Zone Position & Size</h6>
+              <div class="row">
+                <div class="col-md-6">
+                  <div class="mb-3">
+                    <label for="qr-zone-x" class="form-label">X Position (%)</label>
+                    <input type="range" class="form-range" min="0" max="100" id="qr-zone-x" value="70">
+                    <div class="d-flex justify-content-between">
+                      <small>0%</small>
+                      <span id="qr-zone-x-value">70%</span>
+                      <small>100%</small>
+                    </div>
+                  </div>
+                </div>
+                <div class="col-md-6">
+                  <div class="mb-3">
+                    <label for="qr-zone-y" class="form-label">Y Position (%)</label>
+                    <input type="range" class="form-range" min="0" max="100" id="qr-zone-y" value="0">
+                    <div class="d-flex justify-content-between">
+                      <small>0%</small>
+                      <span id="qr-zone-y-value">0%</span>
+                      <small>100%</small>
+                    </div>
+                  </div>
+                </div>
+                <div class="row">
+                  <div class="col-md-6">
+                    <div class="mb-3">
+                      <label for="qr-zone-width" class="form-label">Width (%)</label>
+                      <input type="range" class="form-range" min="10" max="100" id="qr-zone-width" value="30">
+                      <div class="d-flex justify-content-between">
+                        <small>10%</small>
+                        <span id="qr-zone-width-value">30%</span>
+                        <small>100%</small>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="col-md-6">
+                    <div class="mb-3">
+                      <label for="qr-zone-height" class="form-label">Height (%)</label>
+                      <input type="range" class="form-range" min="10" max="100" id="qr-zone-height" value="100">
+                      <div class="d-flex justify-content-between">
+                        <small>10%</small>
+                        <span id="qr-zone-height-value">100%</span>
+                        <small>100%</small>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          
+          <!-- Shelf Zone Settings -->
+          <div class="tab-pane fade" id="shelf-zone-tab" role="tabpanel" aria-labelledby="shelf-tab">
+            <div class="mb-3">
+              <h6>Shelf Zone Position & Size</h6>
+              <div class="row">
+                <div class="col-md-6">
+                  <div class="mb-3">
+                    <label for="shelf-zone-x" class="form-label">X Position (%)</label>
+                    <input type="range" class="form-range" min="0" max="100" id="shelf-zone-x" value="5">
+                    <div class="d-flex justify-content-between">
+                      <small>0%</small>
+                      <span id="shelf-zone-x-value">5%</span>
+                      <small>100%</small>
+                    </div>
+                  </div>
+                </div>
+                <div class="col-md-6">
+                  <div class="mb-3">
+                    <label for="shelf-zone-y" class="form-label">Y Position (%)</label>
+                    <input type="range" class="form-range" min="0" max="100" id="shelf-zone-y" value="30">
+                    <div class="d-flex justify-content-between">
+                      <small>0%</small>
+                      <span id="shelf-zone-y-value">30%</span>
+                      <small>100%</small>
+                    </div>
+                  </div>
+                </div>
+                <div class="row">
+                  <div class="col-md-6">
+                    <div class="mb-3">
+                      <label for="shelf-zone-width" class="form-label">Width (%)</label>
+                      <input type="range" class="form-range" min="10" max="100" id="shelf-zone-width" value="45">
+                      <div class="d-flex justify-content-between">
+                        <small>10%</small>
+                        <span id="shelf-zone-width-value">45%</span>
+                        <small>100%</small>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="col-md-6">
+                    <div class="mb-3">
+                      <label for="shelf-zone-height" class="form-label">Height (%)</label>
+                      <input type="range" class="form-range" min="10" max="100" id="shelf-zone-height" value="60">
+                      <div class="d-flex justify-content-between">
+                        <small>10%</small>
+                        <span id="shelf-zone-height-value">60%</span>
+                        <small>100%</small>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        <div class="alert alert-info mt-3">
+          <h6><i class="bi bi-info-circle me-2"></i>Zone Controls</h6>
+          <p class="mb-1">� Adjust zone positions and sizes to match your camera view</p>
+          <p class="mb-1">� Zones are defined as percentages of the camera view</p>
+          <p class="mb-0">� Changes are applied immediately and saved for future sessions</p>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+        <button type="button" class="btn btn-primary" id="save-zone-settings">Save Settings</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <div class="container-fluid mt-4">
+        <!-- Stats Row -->
+        <div class="row mb-4">
+            <div class="col-md-3">
+                <div class="stats-card text-center">
+                    <div class="stats-number text-primary" id="total-customers">0</div>
+                    <div class="stats-label">Total Customers</div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="stats-card text-center">
+                    <div class="stats-number text-success" id="active-customers">0</div>
+                    <div class="stats-label">Active Customers</div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="stats-card text-center">
+                    <div class="stats-number text-warning" id="items-taken">0</div>
+                    <div class="stats-label">Items Taken</div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="stats-card text-center">
+                    <div class="stats-number text-info" id="avg-time">0m</div>
+                    <div class="stats-label">Avg. Time in Store</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- MQTT Log Row -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header bg-dark text-white d-flex justify-content-between align-items-center">
+                        <h5 class="mb-0"><i class="bi bi-activity me-2"></i>MQTT Log (Weight Events)</h5>
+                        <button class="btn btn-sm btn-outline-light" id="clear-log-btn">Clear</button>
+                    </div>
+                    <div class="card-body p-2" id="mqtt-log" style="height: 200px; overflow-y: auto; background-color: #f8f9fa;">
+                        <div class="text-center text-muted py-5">
+                            <i class="bi bi-activity fs-1"></i>
+                            <p>Waiting for weight events...</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Dashboard -->
+        <div class="row">
+            <!-- Left Column - Customer List -->
+            <div class="col-md-3">
+                <div class="card">
+                    <div class="card-header bg-dark text-white">
+                        <h5 class="mb-0"><i class="bi bi-people-fill me-2"></i>Customers</h5>
+                    </div>
+                    <div class="card-body p-2" id="customer-list" style="height: 550px; overflow-y: auto;">
+                        <div class="loading-spinner">
+                            <div class="spinner-border text-primary" role="status">
+                                <span class="visually-hidden">Loading...</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Column - Shopping Cart -->
+            <div class="col-md-9">
+                <div class="shopping-cart">
+                    <div class="card-header bg-dark text-white">
+                        <h5 class="mb-0"><i class="bi bi-cart-fill me-2"></i>Shopping Cart</h5>
+                    </div>
+                    <div class="card-body">
+                        <div id="selected-customer-info" class="mb-3">
+                            <div class="alert alert-info text-center">
+                                <i class="bi bi-info-circle me-2"></i>Select a customer to view their cart
+                            </div>
+                        </div>
+                        <div id="shopping-cart-items">
+                            <div class="text-center text-muted py-5">
+                                <i class="bi bi-cart-x fs-1"></i>
+                                <p>No items in cart</p>
+                            </div>
+                        </div>
+                        <div class="mt-3" id="cart-summary" style="display: none;">
+                            <hr>
+                            <div class="d-flex justify-content-between fw-bold">
+                                <div>Total Items:</div>
+                                <div id="total-items">0</div>
+                            </div>
+                            <div class="d-flex justify-content-between fw-bold">
+                                <div>Est. Weight:</div>
+                                <div id="total-weight">0g</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // Global variables
+        let customers = {};
+        let selectedCustomerId = null;
+        let socket = null;
+
+        // Update time display
+        function updateTime() {
+            const now = new Date();
+            const timeString = now.toLocaleTimeString();
+            const dateString = now.toLocaleDateString();
+            document.getElementById('current-time').textContent = `${dateString} ${timeString}`;
+        }
+        setInterval(updateTime, 1000);
+        updateTime();
+
+        // Initialize WebSocket connection
+        function initWebSocket() {
+            // For now, we'll use polling instead of WebSocket
+            // WebSocket implementation would require changes to the Flask server
+            pollData();
+            setInterval(pollData, 100); // Poll every 0.1 seconds (100ms)
+        }
+
+        // Poll data from server
+        function pollData() {
+            fetch('/dashboard/data')
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    updateConnectionStatus(true);
+                    // Ensure stats exists before updating
+                    if (data && data.stats) {
+                        updateStats(data.stats);
+                    } else {
+                        console.warn('No stats data received:', data);
+                        // Update with default values
+                        updateStats({
+                            total_customers: 0,
+                            active_customers: 0,
+                            items_taken: 0,
+                            avg_time: '0m'
+                        });
+                    }
+                    updateCustomers(data.customers || {});
+                    updateMqttLog(data.mqtt_events || []);
+                    updateMqttStatus(data.mqtt_status || {});
+                    // Zones removed - no longer needed
+                })
+                .catch(error => {
+                    console.error('Error fetching data:', error);
+                    updateConnectionStatus(false);
+                });
+        }
+        
+        // Update MQTT log
+        function updateMqttLog(mqttEvents) {
+            // Debug logging
+            if (mqttEvents && mqttEvents.length > 0) {
+                console.log(`[MQTT Log] Received ${mqttEvents.length} events`);
+            }
+            
+            if (!mqttEvents || mqttEvents.length === 0) {
+                // Show placeholder if no events and log is empty
+                const logContainer = document.getElementById('mqtt-log');
+                const hasEntries = logContainer.querySelectorAll('.log-entry').length > 0;
+                if (!hasEntries) {
+                    const placeholder = logContainer.querySelector('.text-center.text-muted');
+                    if (!placeholder) {
+                        logContainer.innerHTML = `
+                            <div class="text-center text-muted py-5">
+                                <i class="bi bi-activity fs-1"></i>
+                                <p>Waiting for weight events...</p>
+                            </div>
+                        `;
+                    }
+                }
+                return;
+            }
+            
+            // Get current log entries event IDs to avoid duplicates
+            const logContainer = document.getElementById('mqtt-log');
+            const existingEventIds = new Set();
+            
+            const logEntries = logContainer.querySelectorAll('.log-entry');
+            logEntries.forEach(entry => {
+                const eventId = entry.getAttribute('data-event-id');
+                if (eventId) {
+                    existingEventIds.add(eventId);
+                }
+            });
+            
+            // Add new events
+            mqttEvents.forEach(event => {
+                // Create unique event ID from timestamp + type + customer_id/weight
+                const eventId = `${event.timestamp}_${event.type}_${event.customer_id || event.weight_change_g || 'unknown'}`;
+                
+                if (!existingEventIds.has(eventId)) {
+                    let logType = 'info';
+                    let message = '';
+                    
+                    if (event.type === 'item_picked_up') {
+                        logType = 'pickup';
+                        message = `Customer ${event.customer_id} picked up ${Math.abs(event.weight_change_g || event.item_weight_g || 0)}g item (Confidence: ${Math.round((event.confidence || 0) * 100)}%)`;
+                    } else if (event.type === 'unmatched_weight_event') {
+                        logType = 'unmatched';
+                        message = `Weight change of ${Math.abs(event.weight_change_g || 0)}g detected but no customer in shelf zone (${event.reason || 'unknown'})`;
+                    } else {
+                        message = `Weight event: ${JSON.stringify(event)}`;
+                    }
+                    
+                    addMqttLogEntry(message, logType, event.timestamp, eventId);
+                }
+            });
+        }
+
+        // Update connection status
+        function updateConnectionStatus(isConnected) {
+            const statusIndicator = document.getElementById('connection-status');
+            const statusText = document.getElementById('connection-text');
+            
+            if (isConnected) {
+                statusIndicator.classList.remove('disconnected');
+                statusText.textContent = 'Connected';
+            } else {
+                statusIndicator.classList.add('disconnected');
+                statusText.textContent = 'Disconnected';
+            }
+        }
+
+        // Update statistics
+        function updateStats(stats) {
+            if (!stats) {
+                console.warn('updateStats called with no stats');
+                stats = {
+                    total_customers: 0,
+                    active_customers: 0,
+                    items_taken: 0,
+                    avg_time: '0m'
+                };
+            }
+            
+            const totalCustomersEl = document.getElementById('total-customers');
+            const activeCustomersEl = document.getElementById('active-customers');
+            const itemsTakenEl = document.getElementById('items-taken');
+            const avgTimeEl = document.getElementById('avg-time');
+            
+            if (totalCustomersEl) {
+                totalCustomersEl.textContent = stats.total_customers || 0;
+            }
+            if (activeCustomersEl) {
+                activeCustomersEl.textContent = stats.active_customers || 0;
+            }
+            if (itemsTakenEl) {
+                itemsTakenEl.textContent = stats.items_taken || 0;
+            }
+            if (avgTimeEl) {
+                avgTimeEl.textContent = stats.avg_time || '0m';
+            }
+        }
+        
+        // MQTT Log Functions
+        function addMqttLogEntry(message, type = 'info', eventTimestamp = null, eventId = null) {
+            const logContainer = document.getElementById('mqtt-log');
+            
+            // Format timestamp - use event timestamp if provided, otherwise current time
+            let timestamp;
+            if (eventTimestamp) {
+                try {
+                    const eventDate = new Date(eventTimestamp);
+                    timestamp = eventDate.toLocaleTimeString();
+                } catch (e) {
+                    timestamp = new Date().toLocaleTimeString();
+                }
+            } else {
+                timestamp = new Date().toLocaleTimeString();
+            }
+            
+            // Remove placeholder if exists
+            const placeholder = logContainer.querySelector('.text-center.text-muted');
+            if (placeholder) {
+                placeholder.remove();
+            }
+            
+            // Create log entry
+            const logEntry = document.createElement('div');
+            logEntry.className = 'log-entry mb-2 p-2 border rounded';
+            
+            // Store event ID for deduplication
+            if (eventId) {
+                logEntry.setAttribute('data-event-id', eventId);
+            }
+            
+            // Set background based on message type
+            if (type === 'pickup') {
+                logEntry.style.backgroundColor = 'rgba(40, 167, 69, 0.1)'; // Green
+                logEntry.style.borderColor = 'rgba(40, 167, 69, 0.3)';
+            } else if (type === 'unmatched') {
+                logEntry.style.backgroundColor = 'rgba(255, 193, 7, 0.1)'; // Yellow
+                logEntry.style.borderColor = 'rgba(255, 193, 7, 0.3)';
+            } else {
+                logEntry.style.backgroundColor = 'rgba(13, 110, 253, 0.1)'; // Blue
+                logEntry.style.borderColor = 'rgba(13, 110, 253, 0.3)';
+            }
+            
+            // Get icon based on type
+            let icon = '<i class="bi bi-info-circle me-2"></i>';
+            if (type === 'pickup') {
+                icon = '<i class="bi bi-cart-check me-2"></i>';
+            } else if (type === 'unmatched') {
+                icon = '<i class="bi bi-question-circle me-2"></i>';
+            }
+            
+            logEntry.innerHTML = `
+                <div class="d-flex justify-content-between align-items-start">
+                    <div class="flex-grow-1">
+                        <div class="fw-bold">${icon}Weight Event</div>
+                        <div class="small">${message}</div>
+                    </div>
+                    <div class="text-muted small">${timestamp}</div>
+                </div>
+            `;
+            
+            // Add to beginning of log
+            logContainer.insertBefore(logEntry, logContainer.firstChild);
+            
+            // Limit log entries to 50
+            while (logContainer.children.length > 50) {
+                logContainer.removeChild(logContainer.lastChild);
+            }
+        }
+        
+        function clearMqttLog() {
+            const logContainer = document.getElementById('mqtt-log');
+            logContainer.innerHTML = `
+                <div class="text-center text-muted py-5">
+                    <i class="bi bi-activity fs-1"></i>
+                    <p>Waiting for weight events...</p>
+                </div>
+            `;
+        }
+        
+        // Update MQTT connection status
+        function updateMqttStatus(mqttStatus) {
+            if (!mqttStatus) {
+                console.warn('[MQTT Status] No status data received');
+                return;
+            }
+            
+            const logCard = document.querySelector('#mqtt-log')?.closest('.card');
+            if (!logCard) {
+                console.warn('[MQTT Status] Could not find MQTT log card');
+                return;
+            }
+            
+            const logHeader = logCard.querySelector('.card-header h5');
+            if (!logHeader) {
+                console.warn('[MQTT Status] Could not find header element');
+                return;
+            }
+            
+            const isConnected = mqttStatus.connected === true;
+            const statusIcon = isConnected ? 
+                '<i class="bi bi-wifi text-success me-2" title="MQTT Connected"></i>' : 
+                '<i class="bi bi-wifi-off text-danger me-2" title="MQTT Disconnected"></i>';
+            
+            // Update header with status - always replace to ensure it's current
+            logHeader.innerHTML = statusIcon + '<i class="bi bi-activity me-2"></i>MQTT Log (Weight Events)';
+            
+            // Add tooltip with connection details
+            const broker = mqttStatus.broker || 'unknown';
+            const topic = mqttStatus.topic || 'unknown';
+            if (isConnected) {
+                logHeader.title = `MQTT Connected - Broker: ${broker}, Topic: ${topic}`;
+                console.log(`[MQTT Status] Connected - Broker: ${broker}, Topic: ${topic}`);
+            } else {
+                logHeader.title = `MQTT Disconnected - Broker: ${broker}, Topic: ${topic}`;
+                console.warn(`[MQTT Status] Disconnected - Broker: ${broker}, Topic: ${topic}`);
+            }
+        }
+
+        // Update customers list
+        function updateCustomers(customersData) {
+            customers = customersData;
+            const customerList = document.getElementById('customer-list');
+            
+            if (Object.keys(customers).length === 0) {
+                customerList.innerHTML = `
+                    <div class="text-center text-muted py-5">
+                        <i class="bi bi-people fs-1"></i>
+                        <p>No customers in store</p>
+                    </div>
+                `;
+                return;
+            }
+            
+            let html = '';
+            Object.entries(customers).forEach(([id, customer]) => {
+                const statusClass = customer.confirmed ? 'status-confirmed' : 'status-pending';
+                const statusText = customer.confirmed ? 'Confirmed' : 'Pending';
+                const duration = customer.duration ? formatDuration(customer.duration) : '0m';
+                
+                html += `
+                    <div class="customer-card ${selectedCustomerId === id ? 'active' : ''}" data-customer-id="${id}">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div>
+                                <div class="customer-id">${customer.customer_id}</div>
+                                <div class="text-muted small">Duration: ${duration}</div>
+                            </div>
+                            <div>
+                                <span class="customer-status ${statusClass}">${statusText}</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            });
+            
+            customerList.innerHTML = html;
+            
+            // Add click handlers
+            document.querySelectorAll('.customer-card').forEach(card => {
+                card.addEventListener('click', function() {
+                    selectCustomer(this.dataset.customerId);
+                });
+            });
+            
+            // Customer dots on map removed
+        }
+
+        // Select a customer
+        function selectCustomer(customerId) {
+            selectedCustomerId = customerId;
+            
+            // Update active state in list
+            document.querySelectorAll('.customer-card').forEach(card => {
+                card.classList.remove('active');
+                if (card.dataset.customerId === customerId) {
+                    card.classList.add('active');
+                }
+            });
+            
+            // Update customer info
+            if (customers[customerId]) {
+                updateCustomerInfo(customers[customerId]);
+                updateShoppingCart(customers[customerId]);
+            } else {
+                resetCustomerInfo();
+            }
+        }
+
+        // Update customer info panel
+        function updateCustomerInfo(customer) {
+            const infoDiv = document.getElementById('selected-customer-info');
+            const duration = customer.duration ? formatDuration(customer.duration) : '0m';
+            
+            infoDiv.innerHTML = `
+                <div class="card bg-light">
+                    <div class="card-body">
+                        <h5 class="card-title mb-3">${customer.customer_id}</h5>
+                        <div class="d-flex justify-content-between mb-2">
+                            <span>Status:</span>
+                            <span>${customer.confirmed ? '<span class="badge bg-success">Confirmed</span>' : '<span class="badge bg-warning">Pending</span>'}</span>
+                        </div>
+                        <div class="d-flex justify-content-between mb-2">
+                            <span>Duration:</span>
+                            <span>${duration}</span>
+                        </div>
+                        <div class="d-flex justify-content-between mb-2">
+                            <span>Items in Cart:</span>
+                            <span>${customer.shopping_cart ? customer.shopping_cart.length : 0}</span>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Reset customer info panel
+        function resetCustomerInfo() {
+            document.getElementById('selected-customer-info').innerHTML = `
+                <div class="alert alert-info text-center">
+                    <i class="bi bi-info-circle me-2"></i>Select a customer to view their cart
+                </div>
+            `;
+            document.getElementById('shopping-cart-items').innerHTML = `
+                <div class="text-center text-muted py-5">
+                    <i class="bi bi-cart-x fs-1"></i>
+                    <p>No items in cart</p>
+                </div>
+            `;
+            document.getElementById('cart-summary').style.display = 'none';
+        }
+
+        // Update shopping cart
+        function updateShoppingCart(customer) {
+            const cartItems = document.getElementById('shopping-cart-items');
+            const cartSummary = document.getElementById('cart-summary');
+            
+            if (!customer.shopping_cart || customer.shopping_cart.length === 0) {
+                cartItems.innerHTML = `
+                    <div class="text-center text-muted py-5">
+                        <i class="bi bi-cart-x fs-1"></i>
+                        <p>No items in cart</p>
+                    </div>
+                `;
+                cartSummary.style.display = 'none';
+                return;
+            }
+            
+            let html = '';
+            let totalItems = 0;
+            let totalWeight = 0;
+            
+            customer.shopping_cart.forEach((item, index) => {
+                const time = new Date(item.timestamp).toLocaleTimeString();
+                const confidence = Math.round(item.confidence * 100);
+                totalItems++;
+                totalWeight += item.weight_g || 0;
+                
+                html += `
+                    <div class="cart-item">
+                        <div>
+                            <div class="fw-bold">Item #${totalItems}</div>
+                            <div class="text-muted small">Time: ${time} | Confidence: ${confidence}%</div>
+                        </div>
+                        <div class="text-end">
+                            <div class="fw-bold">${item.weight_g}g</div>
+                            <div class="text-muted small">${item.shelf_id}</div>
+                        </div>
+                    </div>
+                `;
+            });
+            
+            cartItems.innerHTML = html;
+            
+            // Update summary
+            document.getElementById('total-items').textContent = totalItems;
+            document.getElementById('total-weight').textContent = `${totalWeight}g`;
+            cartSummary.style.display = 'block';
+        }
+
+
+        // Format duration from seconds to human readable format
+        function formatDuration(seconds) {
+            if (!seconds) return '0m';
+            
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            
+            if (hours > 0) {
+                return `${hours}h ${minutes}m`;
+            } else {
+                return `${minutes}m`;
+            }
+        }
+
+        // Initialize dashboard
+        document.addEventListener('DOMContentLoaded', function() {
+            initWebSocket();
+            
+            // Add clear log button handler
+            document.getElementById('clear-log-btn').addEventListener('click', clearMqttLog);
+        });
+    </script>
+</body>
+</html>

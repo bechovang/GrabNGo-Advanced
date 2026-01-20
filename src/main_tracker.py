@@ -12,6 +12,11 @@ from collections import defaultdict, deque
 from datetime import datetime
 import numpy as np
 from enum import Enum
+
+# Import modules
+from .tracker.reid import LightweightReID
+from .mqtt.client import MQTTClient
+
 # Import holding_detector with fallback for different execution contexts
 # Make it optional since holding detection is currently disabled
 HoldingDetector = None
@@ -29,7 +34,6 @@ try:
         from src.holding_detector import HoldingDetector
 except ImportError:
     # MediaPipe might not be available - holding detection will be disabled
-    print("⚠️  Warning: HoldingDetector not available (mediapipe may be missing). Holding detection disabled.")
     class HoldingDetector:
         def __init__(self):
             pass
@@ -43,128 +47,6 @@ class TrackState(Enum):
     CONFIRMED = "CONFIRMED"  # Manually confirmed by user
 
 
-class LightweightReID:
-    """Lightweight ReID: LAB color + HOG + texture + edge density."""
-
-    def __init__(self):
-        self.feature_dim = 512
-
-    def extract_features(self, frame, bbox):
-        try:
-            x1, y1, x2, y2 = map(int, bbox)
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(frame.shape[1], x2)
-            y2 = min(frame.shape[0], y2)
-            if x2 <= x1 or y2 <= y1:
-                return None
-            crop = frame[y1:y2, x1:x2]
-            if crop.size == 0:
-                return None
-            crop = cv2.resize(crop, (128, 256))
-            h = crop.shape[0]
-            head = crop[: int(h * 0.3), :]
-            torso = crop[int(h * 0.3) : int(h * 0.7), :]
-            legs = crop[int(h * 0.7) :, :]
-            feats = []
-            for region in (head, torso, legs):
-                feats.append(self._lab(region))
-            for region in (head, torso, legs):
-                feats.append(self._hog(region))
-            for region in (head, torso, legs):
-                feats.append(self._texture(region))
-            for region in (head, torso, legs):
-                feats.append(self._edge_density(region))
-            features = np.concatenate(feats)
-            if len(features) > self.feature_dim:
-                features = features[: self.feature_dim]
-            else:
-                features = np.pad(features, (0, self.feature_dim - len(features)), "constant")
-            features = features / (np.linalg.norm(features) + 1e-8)
-            return features
-        except Exception:
-            return None
-
-    def _lab(self, img):
-        if img.size == 0:
-            return np.zeros(64)
-        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-        hist_l = cv2.calcHist([lab], [0], None, [32], [0, 100])
-        hist_a = cv2.calcHist([lab], [1], None, [16], [0, 255])
-        hist_b = cv2.calcHist([lab], [2], None, [16], [0, 255])
-        hist_l = cv2.normalize(hist_l, hist_l).flatten()
-        hist_a = cv2.normalize(hist_a, hist_a).flatten()
-        hist_b = cv2.normalize(hist_b, hist_b).flatten()
-        return np.concatenate([hist_l, hist_a, hist_b])
-
-    def _hog(self, img):
-        if img.size == 0:
-            return np.zeros(64)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        if gray.shape[0] < 8 or gray.shape[1] < 8:
-            gray = cv2.resize(gray, (16, 16))
-        gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        magnitude = np.sqrt(gx**2 + gy**2)
-        direction = np.arctan2(gy, gx) * 180 / np.pi
-        direction = ((direction + 180) % 360).astype(np.uint8)
-        h, w = magnitude.shape
-        cell = 8
-        n_x, n_y = w // cell, h // cell
-        hist = np.zeros(64)
-        for i in range(0, min(n_y * cell, h), cell):
-            for j in range(0, min(n_x * cell, w), cell):
-                cell_mag = magnitude[i : i + cell, j : j + cell]
-                cell_dir = direction[i : i + cell, j : j + cell]
-                for mag, d in zip(cell_mag.flatten(), cell_dir.flatten()):
-                    bin_idx = int(d / 360 * 64) % 64
-                    hist[bin_idx] += mag
-        hist = hist / (np.linalg.norm(hist) + 1e-8)
-        return hist
-
-    def _texture(self, img):
-        if img.size == 0:
-            return np.zeros(32)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        if gray.shape[0] < 8 or gray.shape[1] < 8:
-            gray = cv2.resize(gray, (16, 16))
-        kernel = np.ones((3, 3), np.float32) / 9
-        local_mean = cv2.filter2D(gray.astype(np.float32), -1, kernel)
-        local_var = cv2.filter2D((gray.astype(np.float32) - local_mean) ** 2, -1, kernel)
-        hist = cv2.calcHist([local_var.astype(np.uint8)], [0], None, [32], [0, 256])
-        hist = cv2.normalize(hist, hist).flatten()
-        return hist
-
-    def _edge_density(self, img):
-        if img.size == 0:
-            return np.zeros(16)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
-        h, w = edges.shape
-        grid_h, grid_w = 4, 4
-        cell_h, cell_w = max(1, h // grid_h), max(1, w // grid_w)
-        densities = []
-        for i in range(grid_h):
-            for j in range(grid_w):
-                cell = edges[i * cell_h : (i + 1) * cell_h, j * cell_w : (j + 1) * cell_w]
-                density = np.sum(cell > 0) / (cell_h * cell_w)
-                densities.append(density)
-        densities = np.array(densities[:16])
-        if len(densities) < 16:
-            densities = np.pad(densities, (0, 16 - len(densities)), "constant")
-        return densities
-
-    @staticmethod
-    def similarity(f1, f2):
-        if f1 is None or f2 is None:
-            return 0.0
-        try:
-            dp = np.dot(f1, f2)
-            return float(dp / (np.linalg.norm(f1) * np.linalg.norm(f2) + 1e-8))
-        except Exception:
-            return 0.0
-
-
 class RetailCustomerTracker:
     """
     Production-ready retail customer tracking system.
@@ -172,7 +54,7 @@ class RetailCustomerTracker:
     """
     
     def __init__(self, 
-                 detection_model='yolo11n-pose.pt',  # Changed to pose model
+                 detection_model='models/yolo11n-pose.pt',  # Changed to pose model
                  tracker_config='config/botsort_reid.yaml',
                  device='cuda' if torch.cuda.is_available() else 'cpu'):
         """
@@ -183,8 +65,6 @@ class RetailCustomerTracker:
             tracker_config: Path to custom tracker config (botsort_reid.yaml)
             device: torch device (cuda or cpu)
         """
-        print("🚀 Initializing Retail Customer Tracker...")
-        
         self.device = device
         self.model = YOLO(detection_model)
         self.tracker_config = tracker_config
@@ -237,8 +117,7 @@ class RetailCustomerTracker:
         # MQTT Configuration for Weight-Based Pickup Detection
         self.mqtt_broker = "test.mosquitto.org"
         self.mqtt_topic_weight = "my-shop/shelf-1/events"
-        self.mqtt_client = None
-        self.mqtt_connected = False
+        self.mqtt_client = None  # Will be MQTTClient instance
         
         # Shelf Zone Configuration (where items are placed)
         # Default: Left side, middle-bottom area (adjust based on camera view)
@@ -250,19 +129,26 @@ class RetailCustomerTracker:
         }
         self.shelf_zone_pixels = None  # Will be calculated from frame size
         
-        # Weight Event Handling
-        self.recent_weight_events = deque(maxlen=10)  # Last 10 events
+        # Zone editing (click and drag)
+        self.dragging_zone = None  # 'qr' or 'shelf' or None
+        self.drag_start = None
+        self.drag_corner = None  # 'top-left', 'top-right', 'bottom-left', 'bottom-right', 'move'
+        self.drag_zone_start = None
+        
+        # Weight Event Handling (will be managed by MQTTClient)
         self.weight_event_timeout = 3.0  # Match events within 3 seconds
         
         # Logs
         self.events = []
         
-        print(f"✅ Tracker ready | Device: {device}")
-        print(f"   Model: {detection_model}")
-        print(f"   Config: {tracker_config}")
-        print(f"   Holding detection: Hand Region Analysis (Edge + YOLO + Texture)")
-        print(f"   QR Zone: Right side, full height (70-100% width, 0-100% height)")
-        print(f"   Shelf Zone: Left-middle area (0-50% width, 30-90% height)")
+        # Shared stats manager (for multi-process stats sharing)
+        try:
+            from .utils.stats_manager import StatsManager
+            self.stats_manager = StatsManager()
+        except ImportError:
+            self.stats_manager = None
+        
+        # Tracker ready
     
     def process_frame(self, frame, conf=0.6, iou=0.5, return_annotated=True):
         """
@@ -300,11 +186,7 @@ class RetailCustomerTracker:
             confs = result.boxes.conf.cpu().numpy()
             keypoints = result.keypoints.data.cpu().numpy() if result.keypoints is not None else None
             
-            # DEBUG: Check if keypoints are available
-            if keypoints is None:
-                print(f"⚠️  DEBUG | YOLO result has NO keypoints! Model might not be pose model.")
-            else:
-                print(f"✓ DEBUG | Keypoints available: shape={keypoints.shape}")
+            # Keypoints check (no debug print)
             
             for idx, (track_id, box, conf_score) in enumerate(zip(track_ids, boxes, confs)):
                 current_track_ids.add(int(track_id))
@@ -366,7 +248,6 @@ class RetailCustomerTracker:
             if matched:
                 customer = matched
                 self.customers[track_id] = customer
-                print(f"🔄 ReID | {customer['customer_id']} (New Track {track_id})")
             else:
                 # Create PENDING track (requires manual confirmation)
                 pending_id = f"PENDING_{track_id:04d}"
@@ -386,7 +267,6 @@ class RetailCustomerTracker:
                 if features is not None:
                     self.pending_tracks[track_id]['feature_gallery'].append(features)
                 self.pending_tracks[track_id]['confidence_scores'].append(conf)
-                print(f"⏳ Pending | {pending_id} (Track {track_id}) - Collecting info...")
                 return  # Don't update until confirmed
         
         # Update existing PENDING track
@@ -414,8 +294,8 @@ class RetailCustomerTracker:
             # Check if ready for confirmation (with relative checking)
             is_valid, validation_score, _ = self._validate_pending_track(pending, all_current_boxes)
             if is_valid and len(pending['feature_gallery']) == self.min_samples_required:
-                # Just reached minimum - notify user
-                print(f"✓ Ready | {pending['pending_id']} - Can confirm now (Press 'c')")
+                # Track ready for confirmation
+                pass
             
             return
         
@@ -517,28 +397,24 @@ class RetailCustomerTracker:
         if not upper_body_visible:
             issues.append("❌ CRITICAL: Upper body not visible - need to see head/torso")
             scores.append(0.0)  # Critical: must see upper body
-            print(f"   ❌ Upper body not visible for {pending.get('pending_id', 'track')} - CANNOT CONFIRM without seeing upper body")
             # HARD REQUIREMENT: If upper body not visible, validation fails immediately
             validation_score = 0.0
             is_valid = False
             return is_valid, validation_score, issues
         else:
             scores.append(1.0)
-            print(f"   ✅ Upper body visible for {pending.get('pending_id', 'track')}")
         
         # 6. Check if legs are visible - HARD REQUIREMENT (must see at least 1 ankle keypoint - orange)
         legs_visible = self._check_legs_visible(pending)
         if not legs_visible:
             issues.append("❌ CRITICAL: Legs not visible - need at least 1 ankle keypoint (orange) to identify pants color")
             scores.append(0.0)  # Critical: must see at least 1 ankle keypoint
-            print(f"   ❌ Legs not visible for {pending.get('pending_id', 'track')} - CANNOT CONFIRM without seeing ankle keypoint")
             # HARD REQUIREMENT: If legs not visible, validation fails immediately
             validation_score = 0.0
             is_valid = False
             return is_valid, validation_score, issues
         else:
             scores.append(1.0)
-            print(f"   ✅ Legs visible for {pending.get('pending_id', 'track')} - ankle keypoint detected")
         
         # 7. Check for relatives nearby - NEW
         # If relatives detected, require more samples for validation
@@ -560,7 +436,6 @@ class RetailCustomerTracker:
                     scores.append(feature_count / required_samples)
                 else:
                     scores.append(1.0)
-                    print(f"   ⚠️  Relatives detected near {pending.get('pending_id', 'track')}, requiring extra validation")
         
         # Overall validation score
         validation_score = np.mean(scores) if scores else 0.0
@@ -572,14 +447,6 @@ class RetailCustomerTracker:
         #       if upper body and legs are visible
         is_valid = validation_score >= 0.8
         
-        # Debug output
-        if is_valid:
-            print(f"   ✅ Validation PASSED: score={validation_score:.1%} (upper body + ankle visible)")
-        else:
-            print(f"   ❌ Validation FAILED: score={validation_score:.1%} < 0.8")
-            if issues:
-                print(f"      Issues: {', '.join(issues[:3])}")  # Show first 3 issues
-        
         return is_valid, validation_score, issues
     
     def confirm_pending_track(self, track_id=None):
@@ -587,12 +454,10 @@ class RetailCustomerTracker:
         if track_id is None:
             # Auto-select first pending
             if not self.pending_tracks:
-                print("⚠️  No pending tracks to confirm")
                 return
             track_id = list(self.pending_tracks.keys())[self.selected_pending_index % len(self.pending_tracks)]
         
         if track_id not in self.pending_tracks:
-            print(f"⚠️  Track {track_id} not in pending")
             return
         
         pending = self.pending_tracks[track_id]
@@ -610,10 +475,6 @@ class RetailCustomerTracker:
         is_valid, validation_score, issues = self._validate_pending_track(pending, all_current_boxes)
         
         if not is_valid:
-            print(f"❌ Cannot confirm {pending['pending_id']} - Insufficient information:")
-            for issue in issues:
-                print(f"   • {issue}")
-            print(f"   Validation score: {validation_score:.1%} (need ≥80%)")
             return
         
         # Create confirmed customer
@@ -654,8 +515,6 @@ class RetailCustomerTracker:
         # Report validation details
         feature_count = len(pending['feature_gallery'])
         avg_conf = np.mean(pending['confidence_scores']) if pending['confidence_scores'] else 0
-        print(f"✅ Confirmed | {customer_id} (Track {track_id})")
-        print(f"   Validation: {validation_score:.0%} | Samples: {feature_count} | Conf: {avg_conf:.2f}")
     
     def select_pending_track(self, index):
         """Select a pending track by index (1-9)."""
@@ -666,7 +525,6 @@ class RetailCustomerTracker:
         if 0 <= self.selected_pending_index < len(track_ids):
             track_id = track_ids[self.selected_pending_index]
             pending = self.pending_tracks[track_id]
-            print(f"👉 Selected: {pending['pending_id']}")
     
     def _cleanup_pending_tracks(self):
         """Remove old pending tracks that timeout."""
@@ -678,8 +536,6 @@ class RetailCustomerTracker:
                 to_remove.append(track_id)
         
         for track_id in to_remove:
-            pending = self.pending_tracks[track_id]
-            print(f"⏱️  Timeout | {pending['pending_id']} removed (no confirmation)")
             del self.pending_tracks[track_id]
     
     def _update_qr_zone(self, frame_shape):
@@ -756,22 +612,40 @@ class RetailCustomerTracker:
         zone_active, pending_id, pending_count = self._check_qr_zone()
         
         # Draw rectangle
-        if zone_active and pending_count == 1:
+        is_dragging = self.dragging_zone == 'qr'
+        if is_dragging:
+            color = (255, 255, 0)  # Yellow when dragging
+            thickness = 3
+            # Draw corner handles
+            corner_size = 10
+            cv2.circle(frame, (x1, y1), corner_size, (0, 255, 255), -1)
+            cv2.circle(frame, (x2, y1), corner_size, (0, 255, 255), -1)
+            cv2.circle(frame, (x1, y2), corner_size, (0, 255, 255), -1)
+            cv2.circle(frame, (x2, y2), corner_size, (0, 255, 255), -1)
+        elif zone_active and pending_count == 1:
             color = (0, 255, 0)  # Green = active, ready to scan
             thickness = 3
         else:
             color = (0, 0, 255)  # Red = inactive, waiting
             thickness = 2
+            # Draw corner handles when not active (for editing)
+            corner_size = 8
+            cv2.circle(frame, (x1, y1), corner_size, color, 2)
+            cv2.circle(frame, (x2, y1), corner_size, color, 2)
+            cv2.circle(frame, (x1, y2), corner_size, color, 2)
+            cv2.circle(frame, (x2, y2), corner_size, color, 2)
         
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
         
         # Draw label
-        if zone_active and pending_count == 1:
+        if is_dragging:
+            label = "QR ZONE [DRAGGING] - Release to finish"
+        elif zone_active and pending_count == 1:
             label = f"QR ZONE ✅ ACTIVE - {pending_id}"
         elif pending_count > 1:
             label = f"QR ZONE ⚠️ MULTIPLE ({pending_count})"
         else:
-            label = "QR ZONE ⏸️ WAITING"
+            label = "QR ZONE ⏸️ WAITING (Click & drag to adjust)"
         
         # Draw label with background
         label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
@@ -830,13 +704,34 @@ class RetailCustomerTracker:
         x1, y1 = zone['x1'], zone['y1']
         x2, y2 = zone['x2'], zone['y2']
         
-        # Draw rectangle (yellow/cyan for shelf zone)
-        color = (0, 255, 255)  # Cyan
-        thickness = 2
+        # Draw rectangle
+        is_dragging = self.dragging_zone == 'shelf'
+        if is_dragging:
+            color = (255, 255, 0)  # Yellow when dragging
+            thickness = 3
+            # Draw corner handles
+            corner_size = 10
+            cv2.circle(frame, (x1, y1), corner_size, (0, 255, 255), -1)
+            cv2.circle(frame, (x2, y1), corner_size, (0, 255, 255), -1)
+            cv2.circle(frame, (x1, y2), corner_size, (0, 255, 255), -1)
+            cv2.circle(frame, (x2, y2), corner_size, (0, 255, 255), -1)
+        else:
+            color = (0, 255, 255)  # Cyan
+            thickness = 2
+            # Draw corner handles (for editing)
+            corner_size = 8
+            cv2.circle(frame, (x1, y1), corner_size, color, 2)
+            cv2.circle(frame, (x2, y1), corner_size, color, 2)
+            cv2.circle(frame, (x1, y2), corner_size, color, 2)
+            cv2.circle(frame, (x2, y2), corner_size, color, 2)
+        
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
         
         # Draw label
-        label = "SHELF ZONE"
+        if is_dragging:
+            label = "SHELF ZONE [DRAGGING] - Release to finish"
+        else:
+            label = "SHELF ZONE (Click & drag to adjust)"
         label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
         label_y = y1 - 10 if y1 > 30 else y2 + 25
         cv2.rectangle(frame, (x1, label_y - label_size[1] - 5), 
@@ -848,147 +743,22 @@ class RetailCustomerTracker:
     
     def _init_mqtt(self):
         """Initialize MQTT client and subscribe to weight events."""
-        try:
-            import paho.mqtt.client as mqtt
-            import uuid
-            import socket
-            import time
-            
-            # Check if paho-mqtt is installed
-            try:
-                import paho.mqtt.client as mqtt
-            except ImportError:
-                print("⚠️  paho-mqtt not installed. Install with: pip install paho-mqtt")
-                print("   Weight-based pickup detection will be disabled")
-                self.mqtt_connected = False
-                return
-            
-            # Test network connectivity first
-            print(f"🔍 Testing connection to {self.mqtt_broker}:1883...")
-            try:
-                test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                test_socket.settimeout(5)  # 5 second timeout
-                result = test_socket.connect_ex((self.mqtt_broker, 1883))
-                test_socket.close()
-                
-                if result != 0:
-                    print(f"⚠️  Cannot reach {self.mqtt_broker}:1883 (connection refused or timeout)")
-                    print(f"   This might be due to:")
-                    print(f"   - Firewall blocking port 1883")
-                    print(f"   - Network connectivity issues")
-                    print(f"   - Broker is down")
-                    print(f"   💡 Tip: Try using a local MQTT broker or check your network")
-                    self.mqtt_connected = False
-                    return
-            except Exception as e:
-                print(f"⚠️  Network test failed: {e}")
-                print(f"   Cannot verify connectivity to {self.mqtt_broker}")
-                # Continue anyway, let MQTT client handle the connection
-            
-            client_id = f"cv-system-{uuid.uuid4().hex[:8]}"
-            self.mqtt_client = mqtt.Client(client_id=client_id)
-            self.mqtt_client.on_connect = self._on_mqtt_connect
-            self.mqtt_client.on_message = self._on_mqtt_message
-            self.mqtt_client.on_disconnect = self._on_mqtt_disconnect
-            
-            # Set connection timeout and connect
-            print(f"   Attempting to connect to {self.mqtt_broker}:1883...")
-            try:
-                self.mqtt_client.connect_async(self.mqtt_broker, 1883, 60)
-                self.mqtt_client.loop_start()  # Start background thread
-                
-                print(f"✅ MQTT client initialized (connecting to {self.mqtt_broker}...)")
-                print(f"   Waiting for connection... (this may take a few seconds)")
-                
-                # Wait a bit for connection to establish
-                time.sleep(2)
-                
-                # Check connection status
-                if not self.mqtt_connected:
-                    print(f"⚠️  MQTT connection pending... (checking again in 3 seconds)")
-                    # Give it more time
-                    time.sleep(3)
-                    if not self.mqtt_connected:
-                        print(f"❌ MQTT connection timeout - broker may be unreachable")
-                        print(f"   Current status: mqtt_connected = {self.mqtt_connected}")
-                        print(f"   💡 Run 'python test_mqtt_connection.py' to diagnose the issue")
-            except Exception as conn_error:
-                print(f"❌ Failed to start MQTT connection: {conn_error}")
-                self.mqtt_connected = False
-                    
-        except ImportError:
-            print("⚠️  paho-mqtt not installed. Install with: pip install paho-mqtt")
-            print("   Weight-based pickup detection will be disabled")
-            self.mqtt_connected = False
-        except Exception as e:
-            print(f"⚠️  MQTT initialization failed: {e}")
-            print(f"   Error type: {type(e).__name__}")
-            import traceback
-            traceback.print_exc()
-            print("   Weight-based pickup detection will be disabled")
-            self.mqtt_connected = False
+        # Create MQTT client with callback
+        self.mqtt_client = MQTTClient(
+            broker=self.mqtt_broker,
+            topic=self.mqtt_topic_weight,
+            on_weight_event=self._handle_weight_event
+        )
+        
+        # Connect
+        self.mqtt_client.connect()
     
-    def _on_mqtt_connect(self, client, userdata, flags, rc):
-        """Callback when MQTT client connects."""
-        if rc == 0:
-            self.mqtt_connected = True
-            # Subscribe to weight events topic
-            result = client.subscribe(self.mqtt_topic_weight)
-            if result[0] == 0:
-                print(f"✅ MQTT connected to {self.mqtt_broker}")
-                print(f"   Subscribed to: {self.mqtt_topic_weight}")
-            else:
-                print(f"⚠️  MQTT connected but subscription failed with code {result[0]}")
-        else:
-            error_messages = {
-                1: "Connection refused - incorrect protocol version",
-                2: "Connection refused - invalid client identifier",
-                3: "Connection refused - server unavailable",
-                4: "Connection refused - bad username or password",
-                5: "Connection refused - not authorised"
-            }
-            error_msg = error_messages.get(rc, f"Unknown error code {rc}")
-            print(f"❌ MQTT connection failed with code {rc}: {error_msg}")
-            print(f"   Broker: {self.mqtt_broker}:1883")
-            print(f"   Topic: {self.mqtt_topic_weight}")
-            self.mqtt_connected = False
-    
-    def _on_mqtt_disconnect(self, client, userdata, rc):
-        """Callback when MQTT client disconnects."""
-        self.mqtt_connected = False
-        if rc != 0:
-            print(f"⚠️  MQTT disconnected unexpectedly (code {rc})")
-        else:
-            print("ℹ️  MQTT disconnected")
-    
-    def _on_mqtt_message(self, client, userdata, msg):
-        """Handle incoming MQTT weight change events."""
-        try:
-            topic_str = msg.topic.decode('utf-8') if isinstance(msg.topic, bytes) else msg.topic
-            message_str = msg.payload.decode('utf-8') if isinstance(msg.payload, bytes) else str(msg.payload)
-            
-            if topic_str == self.mqtt_topic_weight:
-                # Parse: "CHANGE:-480"
-                if message_str.startswith("CHANGE:"):
-                    weight_change = int(message_str.split(":")[1])
-                    timestamp = datetime.now()
-                    
-                    # Store event
-                    self.recent_weight_events.append({
-                        'weight_change_g': weight_change,
-                        'timestamp': timestamp
-                    })
-                    
-                    print(f"\n⚖️  Weight Event: {weight_change:+d}g at {timestamp.strftime('%H:%M:%S.%f')[:-3]}")
-                    
-                    # Process weight event
-                    self._handle_weight_event(weight_change, timestamp)
-                else:
-                    print(f"⚠️  Unknown MQTT message format: {message_str}")
-        except Exception as e:
-            print(f"⚠️  Error processing MQTT message: {e}")
-            import traceback
-            traceback.print_exc()
+    @property
+    def mqtt_connected(self):
+        """Get MQTT connection status (synced with client)."""
+        if self.mqtt_client:
+            return self.mqtt_client.connected
+        return False
     
     def _find_customers_in_shelf_zone(self):
         """Find all confirmed customers currently in shelf zone."""
@@ -1122,14 +892,10 @@ class RetailCustomerTracker:
             return
         
         # Weight decreased (item picked up)
-        print(f"   🔍 Looking for customer who picked up item ({abs(weight_change_g)}g)...")
-        
         # Find confirmed customers in shelf zone
         candidates = self._find_customers_in_shelf_zone()
         
         if not candidates:
-            print(f"   ⚠️  No confirmed customers in shelf zone")
-            print(f"   📝 Logging as unmatched event")
             self._log_unmatched_event(weight_change_g, timestamp, "no_customer_in_zone")
             return
         
@@ -1137,13 +903,11 @@ class RetailCustomerTracker:
         ranked = self._rank_customers_by_pickup_likelihood(candidates, timestamp)
         
         if not ranked:
-            print(f"   ⚠️  No suitable candidate found")
             self._log_unmatched_event(weight_change_g, timestamp, "no_suitable_candidate")
             return
         
         # Ping closest/most likely customer
         best_customer = ranked[0]
-        print(f"   ✅ Found {len(ranked)} candidate(s), best: {best_customer['customer_id']} (score: {best_customer['combined_score']:.0%})")
         self._ping_customer_pickup(best_customer, weight_change_g, timestamp)
     
     def _log_unmatched_event(self, weight_change_g, timestamp, reason):
@@ -1157,7 +921,6 @@ class RetailCustomerTracker:
         }
         
         self.events.append(event)
-        print(f"   📝 Unmatched event logged: {abs(weight_change_g)}g, reason: {reason}")
     
     def _ping_customer_pickup(self, customer_data, weight_change_g, timestamp):
         """Ping customer: Update shopping cart with picked up item."""
@@ -1165,14 +928,12 @@ class RetailCustomerTracker:
         customer_id = customer_data['customer_id']
         
         if track_id not in self.customers:
-            print(f"   ⚠️  Customer {customer_id} not found in customers dict")
             return
         
         customer = self.customers[track_id]
         
         # Validate weight change (must be negative for pickup)
         if weight_change_g >= 0:
-            print(f"   ⚠️  Invalid weight change: {weight_change_g}g (expected negative for pickup)")
             return
         
         weight_grams = abs(weight_change_g)
@@ -1190,7 +951,6 @@ class RetailCustomerTracker:
                     try:
                         last_ping_time = datetime.fromisoformat(last_ping_time.replace('Z', '+00:00'))
                     except:
-                        print(f"   ⚠️  Could not parse last_pickup_time: {last_ping_time}")
                         last_ping_time = None
             
             if last_ping_time is not None:
@@ -1202,10 +962,9 @@ class RetailCustomerTracker:
                     except:
                         timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
                 
-                time_since_last = (timestamp - last_ping_time).total_seconds()
-                if time_since_last < 2.0:
-                    print(f"   ⏸️  Rate limited: Last ping was {time_since_last:.1f}s ago (min 2s)")
-                    return
+            time_since_last = (timestamp - last_ping_time).total_seconds()
+            if time_since_last < 2.0:
+                return
         
         # Create item entry
         item_entry = {
@@ -1241,7 +1000,6 @@ class RetailCustomerTracker:
                     
                     time_diff = abs((event_time - item_time).total_seconds())
                     if time_diff < 3.0:
-                        print(f"   ⚠️  Duplicate item detected: {weight_grams}g within {time_diff:.1f}s - skipping")
                         return
                 except Exception as e:
                     # If parsing fails, just add the item
@@ -1279,6 +1037,211 @@ class RetailCustomerTracker:
         print(f"      Shopping cart: {len(customer['shopping_cart'])} items")
         print(f"      Total weight: {sum(item.get('weight_g', 0) for item in customer['shopping_cart'])}g")
     
+    def _mouse_callback(self, event, x, y, flags, param):
+        """Handle mouse events for zone editing - click and drag to adjust zones."""
+        frame_h, frame_w = param['frame_shape'][:2]
+        corner_size = 15  # Size of corner handles
+        
+        # Check which zone is clicked
+        qr_zone = self.qr_zone_pixels
+        shelf_zone = self.shelf_zone_pixels
+        
+        if event == cv2.EVENT_LBUTTONDOWN:
+            # Check QR zone
+            if qr_zone:
+                qx1, qy1 = qr_zone['x1'], qr_zone['y1']
+                qx2, qy2 = qr_zone['x2'], qr_zone['y2']
+                
+                # Check corners
+                if abs(x - qx1) < corner_size and abs(y - qy1) < corner_size:
+                    self.dragging_zone = 'qr'
+                    self.drag_corner = 'top-left'
+                    self.drag_start = (x, y)
+                    self.drag_zone_start = qr_zone.copy()
+                elif abs(x - qx2) < corner_size and abs(y - qy1) < corner_size:
+                    self.dragging_zone = 'qr'
+                    self.drag_corner = 'top-right'
+                    self.drag_start = (x, y)
+                    self.drag_zone_start = qr_zone.copy()
+                elif abs(x - qx1) < corner_size and abs(y - qy2) < corner_size:
+                    self.dragging_zone = 'qr'
+                    self.drag_corner = 'bottom-left'
+                    self.drag_start = (x, y)
+                    self.drag_zone_start = qr_zone.copy()
+                elif abs(x - qx2) < corner_size and abs(y - qy2) < corner_size:
+                    self.dragging_zone = 'qr'
+                    self.drag_corner = 'bottom-right'
+                    self.drag_start = (x, y)
+                    self.drag_zone_start = qr_zone.copy()
+                # Check if clicking inside QR zone (for moving)
+                elif qx1 <= x <= qx2 and qy1 <= y <= qy2:
+                    self.dragging_zone = 'qr'
+                    self.drag_corner = 'move'
+                    self.drag_start = (x, y)
+                    self.drag_zone_start = qr_zone.copy()
+            
+            # Check Shelf zone
+            if shelf_zone and self.dragging_zone is None:
+                sx1, sy1 = shelf_zone['x1'], shelf_zone['y1']
+                sx2, sy2 = shelf_zone['x2'], shelf_zone['y2']
+                
+                # Check corners
+                if abs(x - sx1) < corner_size and abs(y - sy1) < corner_size:
+                    self.dragging_zone = 'shelf'
+                    self.drag_corner = 'top-left'
+                    self.drag_start = (x, y)
+                    self.drag_zone_start = shelf_zone.copy()
+                elif abs(x - sx2) < corner_size and abs(y - sy1) < corner_size:
+                    self.dragging_zone = 'shelf'
+                    self.drag_corner = 'top-right'
+                    self.drag_start = (x, y)
+                    self.drag_zone_start = shelf_zone.copy()
+                elif abs(x - sx1) < corner_size and abs(y - sy2) < corner_size:
+                    self.dragging_zone = 'shelf'
+                    self.drag_corner = 'bottom-left'
+                    self.drag_start = (x, y)
+                    self.drag_zone_start = shelf_zone.copy()
+                elif abs(x - sx2) < corner_size and abs(y - sy2) < corner_size:
+                    self.dragging_zone = 'shelf'
+                    self.drag_corner = 'bottom-right'
+                    self.drag_start = (x, y)
+                    self.drag_zone_start = shelf_zone.copy()
+                # Check if clicking inside shelf zone (for moving)
+                elif sx1 <= x <= sx2 and sy1 <= y <= sy2:
+                    self.dragging_zone = 'shelf'
+                    self.drag_corner = 'move'
+                    self.drag_start = (x, y)
+                    self.drag_zone_start = shelf_zone.copy()
+        
+        elif event == cv2.EVENT_MOUSEMOVE and self.dragging_zone:
+            if self.drag_corner == 'move':
+                # Move entire zone
+                dx = x - self.drag_start[0]
+                dy = y - self.drag_start[1]
+                new_x1 = max(0, min(frame_w, self.drag_zone_start['x1'] + dx))
+                new_y1 = max(0, min(frame_h, self.drag_zone_start['y1'] + dy))
+                new_x2 = max(0, min(frame_w, self.drag_zone_start['x2'] + dx))
+                new_y2 = max(0, min(frame_h, self.drag_zone_start['y2'] + dy))
+                
+                # Ensure minimum size
+                if new_x2 - new_x1 < 50:
+                    new_x2 = new_x1 + 50
+                if new_y2 - new_y1 < 50:
+                    new_y2 = new_y1 + 50
+                
+                if self.dragging_zone == 'qr':
+                    self.qr_zone_pixels = {'x1': new_x1, 'y1': new_y1, 'x2': new_x2, 'y2': new_y2}
+                    self.qr_zone_percent = {
+                        'x1_percent': new_x1 / frame_w,
+                        'y1_percent': new_y1 / frame_h,
+                        'x2_percent': new_x2 / frame_w,
+                        'y2_percent': new_y2 / frame_h
+                    }
+                else:  # shelf
+                    self.shelf_zone_pixels = {'x1': new_x1, 'y1': new_y1, 'x2': new_x2, 'y2': new_y2}
+                    self.shelf_zone_percent = {
+                        'x1_percent': new_x1 / frame_w,
+                        'y1_percent': new_y1 / frame_h,
+                        'x2_percent': new_x2 / frame_w,
+                        'y2_percent': new_y2 / frame_h
+                    }
+            else:
+                # Resize corner
+                if self.dragging_zone == 'qr':
+                    current = self.qr_zone_pixels.copy()
+                else:
+                    current = self.shelf_zone_pixels.copy()
+                
+                if self.drag_corner == 'top-left':
+                    new_x1 = max(0, min(x, current['x2'] - 50))
+                    new_y1 = max(0, min(y, current['y2'] - 50))
+                    if self.dragging_zone == 'qr':
+                        self.qr_zone_pixels['x1'] = new_x1
+                        self.qr_zone_pixels['y1'] = new_y1
+                        self.qr_zone_percent['x1_percent'] = new_x1 / frame_w
+                        self.qr_zone_percent['y1_percent'] = new_y1 / frame_h
+                    else:
+                        self.shelf_zone_pixels['x1'] = new_x1
+                        self.shelf_zone_pixels['y1'] = new_y1
+                        self.shelf_zone_percent['x1_percent'] = new_x1 / frame_w
+                        self.shelf_zone_percent['y1_percent'] = new_y1 / frame_h
+                elif self.drag_corner == 'top-right':
+                    new_x2 = max(current['x1'] + 50, min(frame_w, x))
+                    new_y1 = max(0, min(y, current['y2'] - 50))
+                    if self.dragging_zone == 'qr':
+                        self.qr_zone_pixels['x2'] = new_x2
+                        self.qr_zone_pixels['y1'] = new_y1
+                        self.qr_zone_percent['x2_percent'] = new_x2 / frame_w
+                        self.qr_zone_percent['y1_percent'] = new_y1 / frame_h
+                    else:
+                        self.shelf_zone_pixels['x2'] = new_x2
+                        self.shelf_zone_pixels['y1'] = new_y1
+                        self.shelf_zone_percent['x2_percent'] = new_x2 / frame_w
+                        self.shelf_zone_percent['y1_percent'] = new_y1 / frame_h
+                elif self.drag_corner == 'bottom-left':
+                    new_x1 = max(0, min(x, current['x2'] - 50))
+                    new_y2 = max(current['y1'] + 50, min(frame_h, y))
+                    if self.dragging_zone == 'qr':
+                        self.qr_zone_pixels['x1'] = new_x1
+                        self.qr_zone_pixels['y2'] = new_y2
+                        self.qr_zone_percent['x1_percent'] = new_x1 / frame_w
+                        self.qr_zone_percent['y2_percent'] = new_y2 / frame_h
+                    else:
+                        self.shelf_zone_pixels['x1'] = new_x1
+                        self.shelf_zone_pixels['y2'] = new_y2
+                        self.shelf_zone_percent['x1_percent'] = new_x1 / frame_w
+                        self.shelf_zone_percent['y2_percent'] = new_y2 / frame_h
+                elif self.drag_corner == 'bottom-right':
+                    new_x2 = max(current['x1'] + 50, min(frame_w, x))
+                    new_y2 = max(current['y1'] + 50, min(frame_h, y))
+                    if self.dragging_zone == 'qr':
+                        self.qr_zone_pixels['x2'] = new_x2
+                        self.qr_zone_pixels['y2'] = new_y2
+                        self.qr_zone_percent['x2_percent'] = new_x2 / frame_w
+                        self.qr_zone_percent['y2_percent'] = new_y2 / frame_h
+                    else:
+                        self.shelf_zone_pixels['x2'] = new_x2
+                        self.shelf_zone_pixels['y2'] = new_y2
+                        self.shelf_zone_percent['x2_percent'] = new_x2 / frame_w
+                        self.shelf_zone_percent['y2_percent'] = new_y2 / frame_h
+        
+        elif event == cv2.EVENT_LBUTTONUP:
+            self.dragging_zone = None
+            self.drag_corner = None
+            self.drag_start = None
+            self.drag_zone_start = None
+    
+    def save_zone_config(self):
+        """Save zone configuration to file."""
+        import json
+        import os
+        config = {
+            'qr_zone': self.qr_zone_percent,
+            'shelf_zone': self.shelf_zone_percent
+        }
+        config_path = 'config/zone_config.json'
+        os.makedirs('config', exist_ok=True)
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        # Zone configuration saved
+    
+    def load_zone_config(self):
+        """Load zone configuration from file."""
+        import json
+        import os
+        config_path = 'config/zone_config.json'
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    if 'qr_zone' in config:
+                        self.qr_zone_percent = config['qr_zone']
+                    if 'shelf_zone' in config:
+                        self.shelf_zone_percent = config['shelf_zone']
+                pass  # Zone config loaded
+            except Exception as e:
+                pass  # Zone config load failed
+    
     def confirm_pending_with_customer_id(self, customer_id, pending_id=None):
         """
         Confirm a PENDING track with customer_id from QR scan.
@@ -1290,29 +1253,14 @@ class RetailCustomerTracker:
         Returns:
             tuple: (success: bool, message: str)
         """
-        print(f"\n🔔 QR Confirmation Request:")
-        print(f"   Customer ID: {customer_id}")
-        print(f"   Pending ID (provided): {pending_id}")
-        print(f"   Zone active pending: {self.zone_active_pending}")
-        print(f"   Current pending tracks: {list(self.pending_tracks.keys())}")
-        
         # Re-check zone status to get latest state (avoid race condition)
         zone_active, zone_pending_id, pending_count = self._check_qr_zone()
-        print(f"   Zone status (re-checked): active={zone_active}, pending_id={zone_pending_id}, count={pending_count}")
         
         # If pending_id not provided, use zone_active_pending (from latest check)
         if pending_id is None:
             pending_id = zone_pending_id if zone_active and pending_count == 1 else self.zone_active_pending
-            print(f"   Using pending_id: {pending_id}")
         
         if pending_id is None:
-            # Debug: List all pending tracks and their positions
-            print(f"   ❌ No PENDING track in QR zone")
-            print(f"   Available pending tracks:")
-            for tid, pending in self.pending_tracks.items():
-                box = pending.get('box')
-                in_zone = self._is_in_qr_zone(box) if box else False
-                print(f"      - Track {tid}: {pending.get('pending_id')}, in_zone={in_zone}, box={box}")
             return False, "No PENDING track in QR zone"
         
         # Find track_id from pending_id
@@ -1320,12 +1268,9 @@ class RetailCustomerTracker:
         for tid, pending in self.pending_tracks.items():
             if pending.get('pending_id') == pending_id:
                 track_id = tid
-                print(f"   ✅ Found track_id: {track_id} for pending_id: {pending_id}")
                 break
         
         if track_id is None:
-            print(f"   ❌ PENDING track {pending_id} not found in pending_tracks")
-            print(f"   Available pending_ids: {[p.get('pending_id') for p in self.pending_tracks.values()]}")
             return False, f"PENDING track {pending_id} not found"
         
         # Confirm the track
@@ -1340,11 +1285,7 @@ class RetailCustomerTracker:
             if other_track_id != track_id and other_pending.get('box') is not None:
                 all_current_boxes.append(other_pending['box'])
         
-        print(f"   Validating pending track...")
         is_valid, validation_score, issues = self._validate_pending_track(pending, all_current_boxes)
-        print(f"   Validation result: valid={is_valid}, score={validation_score:.0%}")
-        if issues:
-            print(f"   Issues: {issues}")
         
         if not is_valid:
             return False, f"Validation failed (score: {validation_score:.0%})"
@@ -1381,9 +1322,6 @@ class RetailCustomerTracker:
             'timestamp': datetime.now().isoformat(),
             'validation_score': validation_score
         })
-        
-        print(f"✅ Confirmed | {customer_id} (Track {track_id}) from QR scan")
-        print(f"   Validation: {validation_score:.0%} | Samples: {len(customer_data['feature_gallery'])}")
         
         return True, f"Confirmed {customer_id}"
     
@@ -1424,7 +1362,6 @@ class RetailCustomerTracker:
                     'keypoints': last_keypoints,  # Store for legs visibility check
                     'frame_height': last_frame_height  # Store for legs visibility check
                 }
-                print(f"⏸️  Occlusion | {customer['customer_id']} (Track {track_id})")
         
         # Clean up tracks lost too long
         for track_id in list(self.lost_tracks.keys()):
@@ -1451,7 +1388,7 @@ class RetailCustomerTracker:
             'duration_seconds': float(duration),
             'suspicious_count': int(self.customers.get(track_id, {}).get('suspicious_count', 0))
         })
-        print(f"🚪 Exit | {customer_id} (Duration: {duration:.1f}s)")
+        # Customer exit logged
 
     def _iou(self, box1, box2):
         if box1 is None or box2 is None:
@@ -1481,7 +1418,6 @@ class RetailCustomerTracker:
             return False
         
         if keypoints is None or len(keypoints) < 17:
-            print(f"      └─> ❌ No keypoints for upper body check")
             return False
         
         x1, y1, x2, y2 = box
@@ -1497,7 +1433,6 @@ class RetailCustomerTracker:
             nose_y = nose[1]
             # Nose should be in upper 40% of box
             if y1 <= nose_y <= y1 + box_height * 0.4:
-                print(f"      └─> ✅ Nose visible at y={nose_y:.0f} - enough for clothing color")
                 return True
         
         # Check shoulders (torso) - enough to get shirt color
@@ -1508,17 +1443,14 @@ class RetailCustomerTracker:
             shoulder_y = left_shoulder[1]
             # Shoulder should be in upper 60% of box
             if y1 <= shoulder_y <= y1 + box_height * 0.6:
-                print(f"      └─> ✅ Left shoulder visible at y={shoulder_y:.0f} - enough for clothing color")
                 return True
         
         if right_shoulder is not None and len(right_shoulder) >= 3 and right_shoulder[2] > 0.3:
             shoulder_y = right_shoulder[1]
             if y1 <= shoulder_y <= y1 + box_height * 0.6:
-                print(f"      └─> ✅ Right shoulder visible at y={shoulder_y:.0f} - enough for clothing color")
                 return True
         
         # No upper body keypoints found
-        print(f"      └─> ❌ Upper body not visible (no nose or shoulder keypoints)")
         return False
     
     def _check_legs_visible(self, pending):
@@ -1535,7 +1467,6 @@ class RetailCustomerTracker:
         frame_height = pending.get('frame_height')
         
         if box is None:
-            print(f"      └─> ❌ No box data for legs check")
             return False
         
         x1, y1, x2, y2 = box
@@ -1548,19 +1479,6 @@ class RetailCustomerTracker:
         if keypoints is not None and len(keypoints) >= 17:
             left_ankle = keypoints[15] if len(keypoints) > 15 else None
             right_ankle = keypoints[16] if len(keypoints) > 16 else None
-            
-            # DEBUG: Show ankle keypoint data
-            print(f"      └─> DEBUG Ankle check:")
-            if left_ankle is not None:
-                print(f"          Left ankle: x={left_ankle[0]:.0f}, y={left_ankle[1]:.0f}, conf={left_ankle[2]:.3f}")
-            else:
-                print(f"          Left ankle: None")
-            if right_ankle is not None:
-                print(f"          Right ankle: x={right_ankle[0]:.0f}, y={right_ankle[1]:.0f}, conf={right_ankle[2]:.3f}")
-            else:
-                print(f"          Right ankle: None")
-            print(f"          Box: x1={x1:.0f}, y1={y1:.0f}, x2={x2:.0f}, y2={y2:.0f}, height={box_height:.0f}")
-            print(f"          Lower 30% range: y={y1 + box_height * 0.7:.0f} to {y2:.0f}")
             
             # Check if ankle keypoints are visible and within box
             ankles_visible = 0
@@ -1578,11 +1496,6 @@ class RetailCustomerTracker:
                     
                     if lower_bound <= ankle_y <= upper_bound and x1 - box_width * 0.2 <= ankle_x <= x2 + box_width * 0.2:
                         ankles_visible += 1
-                        print(f"      └─> ✅ Left ankle (orange) visible at ({ankle_x:.0f}, {ankle_y:.0f}), conf={ankle_conf:.3f}")
-                    else:
-                        print(f"      └─> ⚠️  Left ankle out of bounds: y={ankle_y:.0f} (need {lower_bound:.0f}-{upper_bound:.0f}), x={ankle_x:.0f}")
-                else:
-                    print(f"      └─> ⚠️  Left ankle confidence too low: {ankle_conf:.3f} < 0.2")
             
             if right_ankle is not None and len(right_ankle) >= 3:
                 ankle_y = right_ankle[1]
@@ -1596,22 +1509,14 @@ class RetailCustomerTracker:
                     
                     if lower_bound <= ankle_y <= upper_bound and x1 - box_width * 0.2 <= ankle_x <= x2 + box_width * 0.2:
                         ankles_visible += 1
-                        print(f"      └─> ✅ Right ankle (orange) visible at ({ankle_x:.0f}, {ankle_y:.0f}), conf={ankle_conf:.3f}")
-                    else:
-                        print(f"      └─> ⚠️  Right ankle out of bounds: y={ankle_y:.0f} (need {lower_bound:.0f}-{upper_bound:.0f}), x={ankle_x:.0f}")
-                else:
-                    print(f"      └─> ⚠️  Right ankle confidence too low: {ankle_conf:.3f} < 0.2")
             
             # REQUIRED: At least 1 ankle keypoint must be visible
             if ankles_visible >= 1:
-                print(f"      └─> ✅ Legs visible ({ankles_visible} ankle keypoint(s) detected)")
                 return True
             else:
-                print(f"      └─> ❌ No ankle keypoints (orange) detected - need at least 1")
                 return False
         
         # If no keypoints, cannot verify legs
-        print(f"      └─> ❌ No keypoints available - cannot verify ankle keypoints")
         return False
     
     def _check_relatives_nearby(self, current_box, lost_box, all_current_boxes, 
@@ -1683,10 +1588,8 @@ class RetailCustomerTracker:
         current_upper_visible = self._check_upper_body_visible(current_pending)
         current_legs_visible = self._check_legs_visible(current_pending)
         if not current_upper_visible:
-            print(f"   ❌ ReID: Current detection has no upper body visible - cannot re-identify")
             return None  # Cannot re-identify without seeing upper body
         if not current_legs_visible:
-            print(f"   ❌ ReID: Current detection has no ankle keypoint (orange) - cannot re-identify")
             return None  # Cannot re-identify without seeing ankle keypoint
         
         for lost_id, data in list(self.lost_tracks.items()):
@@ -1712,10 +1615,8 @@ class RetailCustomerTracker:
             lost_upper_visible = self._check_upper_body_visible(lost_pending)
             lost_legs_visible = self._check_legs_visible(lost_pending)
             if not lost_upper_visible:
-                print(f"   ❌ ReID: Lost track {lost_id} had no upper body visible - skipping")
                 continue  # Skip if lost track didn't have upper body
             if not lost_legs_visible:
-                print(f"   ❌ ReID: Lost track {lost_id} had no ankle keypoint (orange) - skipping")
                 continue  # Skip if lost track didn't have ankle keypoint
             
             # Check for relatives (people nearby) - NEW
@@ -1728,7 +1629,7 @@ class RetailCustomerTracker:
             if has_relatives:
                 # If relatives nearby, require higher similarity to avoid confusion
                 min_sim_thresh = self.reid_high_thresh + 0.1  # Stricter
-                print(f"   ⚠️  Relatives detected near lost track {lost_id}, requiring higher similarity")
+                # Relatives detected - require higher similarity
             else:
                 min_sim_thresh = self.reid_high_thresh
             
@@ -2020,48 +1921,105 @@ class RetailCustomerTracker:
     
     def get_stats(self):
         """Get current tracking statistics."""
-        return {
+        stats = {
             'active_customers': len(self.customers),
             'occluded_tracks': len(self.lost_tracks),
             'pending_tracks': len(self.pending_tracks),
             'total_customers': self.next_customer_id - 1,
             'total_events': len(self.events)
         }
+        
+        # Save to shared file for other processes
+        if self.stats_manager:
+            # Calculate items_taken and avg_time for dashboard
+            items_taken = sum(len(c.get('shopping_cart', [])) for c in self.customers.values())
+            if self.customers:
+                total_duration = sum(
+                    (datetime.now() - (c.get('entry_time') or datetime.now())).total_seconds()
+                    for c in self.customers.values()
+                )
+                avg_duration = total_duration / len(self.customers)
+                avg_minutes = int(avg_duration / 60)
+                avg_seconds = int(avg_duration % 60)
+                avg_time = f"{avg_minutes}m {avg_seconds}s" if avg_minutes > 0 else f"{avg_seconds}s"
+            else:
+                avg_time = '0m'
+            
+            dashboard_stats = {
+                'total_customers': stats['total_customers'],
+                'active_customers': stats['active_customers'],
+                'items_taken': items_taken,
+                'avg_time': avg_time,
+                'total_events': stats['total_events']
+            }
+            self.stats_manager.save_stats(dashboard_stats)
+            
+            # Save customers data
+            customers_data = {}
+            for track_id, customer in self.customers.items():
+                entry_time = customer.get('entry_time') or customer.get('first_seen')
+                last_detection_time = customer.get('last_detection_time') or customer.get('last_seen')
+                
+                customers_data[f"customer_{track_id}"] = {
+                    'track_id': track_id,
+                    'customer_id': customer.get('customer_id', 'UNKNOWN'),
+                    'confirmed': customer.get('state') and (hasattr(customer.get('state'), 'name') and customer.get('state').name == 'CONFIRMED' or str(customer.get('state')) == 'CONFIRMED'),
+                    'first_seen': entry_time.isoformat() if hasattr(entry_time, 'isoformat') else str(entry_time) if entry_time else None,
+                    'last_seen': last_detection_time.isoformat() if hasattr(last_detection_time, 'isoformat') else str(last_detection_time) if last_detection_time else None,
+                    'shopping_cart': customer.get('shopping_cart', []),
+                    'pickup_count': customer.get('pickup_count', 0)
+                }
+            self.stats_manager.save_customers_data(customers_data)
+            
+            # Save MQTT events
+            mqtt_events = [e for e in self.events if e.get('type') in ['item_picked_up', 'unmatched_weight_event']]
+            self.stats_manager.save_mqtt_events(mqtt_events)
+        
+        return stats
     
-    def save_events(self, filename='tracking_events.json'):
+    def save_events(self, filename='data/logs/tracking_events.json'):
         """Save all tracking events to JSON."""
+        # Ensure directory exists
+        import os
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
         with open(filename, 'w') as f:
             json.dump(self.events, f, indent=2, default=str)
-        print(f"💾 Saved {len(self.events)} events to {filename}")
+        # Events saved
 
 
 def main():
     """
     Main tracking loop with visualization.
     """
-    print("\n" + "="*70)
-    print("🎯 SMART RETAIL TRACKING SYSTEM")
-    print("   Tracker: BoT-SORT with native ReID")
-    print("   Features: Appearance matching, Occlusion handling, Motion prediction")
-    print("   QR Confirmation: Bottom-left zone scanning")
-    print("="*70 + "\n")
-    
     # Initialize tracker
-    print("🚀 Initializing tracker...")
-    print("   This may take a moment to load YOLO model...")
     tracker = RetailCustomerTracker(
-        detection_model='yolo11n-pose.pt',  # Use pose model for keypoints
+        detection_model='models/yolo11n-pose.pt',  # Use pose model for keypoints
         tracker_config='config/botsort_reid.yaml'
     )
-    print("   Tracker initialized!")
+    
+    # Load zone configuration if exists
+    tracker.load_zone_config()
     
     # Initialize MQTT for weight-based pickup detection
-    print("🔌 Initializing MQTT...")
     tracker._init_mqtt()
-    print("   MQTT initialization complete")
+    
+    # Start web server for QR scanner (in background thread)
+    try:
+        from src.web.server import run_server
+        import threading
+        import time
+        server_thread = threading.Thread(
+            target=run_server,
+            args=(tracker, '0.0.0.0', 8080, False),
+            daemon=True
+        )
+        server_thread.start()
+        time.sleep(1)  # Give server time to start
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
     
     # Open webcam with timeout
-    print("📹 Opening camera...")
     import time
     cap = None
     try:
@@ -2071,50 +2029,26 @@ def main():
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         
         # Try to read a frame to verify camera works
-        print("   Testing camera...")
         ret, test_frame = cap.read()
         if not ret or test_frame is None:
-            print("❌ Camera opened but cannot read frames!")
             cap.release()
             cap = None
-        else:
-            print(f"✅ Camera ready! Frame size: {test_frame.shape}")
     except Exception as e:
-        print(f"❌ Camera error: {e}")
         if cap:
             cap.release()
         cap = None
     
     if cap is None or not cap.isOpened():
-        print("⚠️  Camera not available!")
-        print("   Dashboard will still work for MQTT events")
-        print("   Press Ctrl+C to exit, or wait for MQTT events...")
-        print("\n   Dashboard: http://localhost:8080/dashboard")
-        
         # Keep running for dashboard/MQTT only
         try:
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
-            print("\n⚠️  Interrupted by user")
+            pass
         return
     
     frame_count = 0
     fps_list = []
-    
-    print("📹 Camera ready!")
-    print("\n📋 Validation Requirements:")
-    print(f"   • Min samples: {tracker.min_samples_required} frames")
-    print(f"   • Min confidence: {tracker.min_confidence_avg:.0%}")
-    print(f"   • Min feature quality: {tracker.min_feature_quality:.0%}")
-    print("\n⌨️  Keys:")
-    print("      q = quit")
-    print("      c = confirm selected pending track (if validated)")
-    print("      1-9 = select pending track by number")
-    print("      s = save logs")
-    print("      i = info")
-    print("\n💡 Note: This is camera tracking only.")
-    print("   For dashboard, run: python run_dashboard.py\n")
     
     try:
         while True:
@@ -2186,6 +2120,11 @@ def main():
             # Show
             cv2.imshow('Retail Tracking - BoT-SORT + ReID', annotated_frame)
             
+            # Set mouse callback for zone editing (update on each frame to get current frame shape)
+            cv2.setMouseCallback('Retail Tracking - BoT-SORT + ReID', 
+                                tracker._mouse_callback, 
+                                {'frame_shape': annotated_frame.shape})
+            
             # Key handling
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
@@ -2199,20 +2138,16 @@ def main():
                 tracker.select_pending_track(num)
             elif key == ord('s'):
                 tracker.save_events()
+            elif key == ord('w'):
+                tracker.save_zone_config()
             elif key == ord('i'):
-                print("\n" + "="*70)
-                print("📊 TRACKER STATISTICS")
-                for k, v in stats.items():
-                    print(f"   {k}: {v}")
-                print("="*70 + "\n")
+                # Info key (no print)
+                pass
             
             frame_count += 1
-            if frame_count % 30 == 0:
-                avg_fps = sum(fps_list[-30:]) / min(30, len(fps_list))
-                print(f"Frame {frame_count}: FPS={avg_fps:.1f}, Active={stats['active_customers']}, Pending={stats['pending_tracks']}, Occluded={stats['occluded_tracks']}")
     
     except KeyboardInterrupt:
-        print("\n⚠️  Interrupted by user")
+        pass
     
     finally:
         # Finalize all customers
@@ -2224,18 +2159,8 @@ def main():
         # Save logs
         tracker.save_events()
         
-        # Statistics
-        print("\n" + "="*70)
-        print(f"📊 FINAL STATISTICS")
-        print(f"   Total frames: {frame_count}")
-        print(f"   Average FPS: {sum(fps_list)/len(fps_list):.1f}")
-        print(f"   Total customers: {tracker.next_customer_id - 1}")
-        print(f"   Total events: {len(tracker.events)}")
-        print("="*70)
-        
         cap.release()
         cv2.destroyAllWindows()
-        print("✅ Done!")
 
 
 if __name__ == '__main__':
